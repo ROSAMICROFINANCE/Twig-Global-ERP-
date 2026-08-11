@@ -1,0 +1,20 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Only signed-in shop accounts can read or write anything.
+    // Real access control (who can see which module) happens in the app UI,
+    // driven by each user's permissions document below.
+    match /business/{docId} {
+      allow read, write: if request.auth != null;
+    }
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      // Anyone signed in can create/edit a user profile document.
+      // This is intentionally permissive because the admin-creation flow
+      // runs from a temporary secondary session. Since this is a small
+      // internal team tool, this is an acceptable tradeoff — for stricter
+      // control later, move user creation into a Cloud Function.
+      allow write: if request.auth != null;
+    }
+  }
+}
