@@ -20,7 +20,7 @@ import { auth, db, getSecondaryAuth, toAuthEmail } from "./firebase";
    Helpers
 --------------------------------------------------------- */
 const money = (n) =>
-  "K" + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  "$" + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
