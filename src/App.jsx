@@ -57,6 +57,7 @@ const REGISTERS = {
     { id: "orders", label: "Sales Orders" },
     { id: "quotes", label: "Quotations" },
     { id: "transferOut", label: "Internal Transfer Out" },
+    { id: "dailyItems", label: "Daily Items Sold" },
     { id: "dailySales", label: "Daily Sales Report" },
     { id: "dailyExpense", label: "Daily Expense Report" },
     { id: "cashBook", label: "Daily Cash Book" },
@@ -69,6 +70,7 @@ const REGISTERS = {
   ],
   stock: [
     { id: "levels", label: "Stock Levels" },
+    { id: "repack", label: "Repackaging" },
     { id: "returns", label: "Goods Returns" },
   ],
   accounting: [
@@ -80,8 +82,8 @@ const REGISTERS = {
 };
 
 const emptyData = () => ({
-  products: [], quotes: [], salesOrders: [], purchaseOrders: [], transfers: [], expenses: [], returns: [], payments: [],
-  counters: { quote: 1, sales: 1, purchase: 1, transfer: 1, exp: 1, ret: 1, product: 1, pay: 1 },
+  products: [], quotes: [], salesOrders: [], purchaseOrders: [], transfers: [], expenses: [], returns: [], payments: [], repacks: [],
+  counters: { quote: 1, sales: 1, purchase: 1, transfer: 1, exp: 1, ret: 1, product: 1, pay: 1, repack: 1 },
   invoiceSettings: { shopName: "", tagline: "", phone: "", footerNote: "", logoDataUrl: "" },
 });
 
@@ -216,6 +218,18 @@ const TabBar = ({ tabs, active, onChange }) => (
 const NoRegistersNotice = ({ module }) => (
   <div className="border border-slate-200 rounded-lg bg-white p-8 text-center text-slate-400 text-sm">
     You have access to {module}, but no specific registers have been assigned yet. Ask your admin to grant them in Settings.
+  </div>
+);
+
+const formatDateLabel = (iso) => {
+  if (iso === todayISO()) return `Today (${iso})`;
+  return iso;
+};
+
+const DateFilterBar = ({ date, setDate, label = "Date" }) => (
+  <div className="flex items-end gap-2 mb-4">
+    <div className="w-48"><Field label={label}><input type="date" className={inputCls} value={date} onChange={(e) => setDate(e.target.value)} /></Field></div>
+    {date !== todayISO() && <Btn variant="ghost" onClick={() => setDate(todayISO())}>Back to today</Btn>}
   </div>
 );
 
@@ -840,6 +854,106 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
   );
 }
 
+/* ---------------------------------------------------------
+   Repackaging (Stock) — break a source product (e.g. box of
+   1000) down into a different product (e.g. packet of 100),
+   moving stock and cost between the two.
+--------------------------------------------------------- */
+function RepackRegister({ data, setData, save, user }) {
+  const [showForm, setShowForm] = useState(false);
+  const blank = { sourceProductId: "", targetProductId: "", sourceQty: 1, yieldPerUnit: 1 };
+  const [form, setForm] = useState(blank);
+
+  const source = data.products.find((p) => p.id === form.sourceProductId);
+  const target = data.products.find((p) => p.id === form.targetProductId);
+  const sourceQty = Number(form.sourceQty) || 0;
+  const yieldPerUnit = Number(form.yieldPerUnit) || 0;
+  const targetQty = sourceQty * yieldPerUnit;
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!source || !target) return;
+    if (source.id === target.id) { alert("Source and target must be different products."); return; }
+    if (sourceQty <= 0 || yieldPerUnit <= 0) { alert("Enter a quantity and a yield greater than zero."); return; }
+    if (source.stock < sourceQty) { if (!confirm(`Only ${source.stock} of ${source.name} in stock. Repack anyway?`)) return; }
+    const unitCost = targetQty > 0 ? (source.costPrice * sourceQty) / targetQty : target.costPrice;
+    const products = data.products.map((p) => {
+      if (p.id === source.id) return { ...p, stock: p.stock - sourceQty };
+      if (p.id === target.id) return { ...p, stock: p.stock + targetQty, costPrice: unitCost, lastRestocked: todayISO() };
+      return p;
+    });
+    const entry = {
+      id: uid(), number: nextNumber("RPK", data.counters.repack), date: todayISO(),
+      sourceProductId: source.id, sourceName: source.name, sourceQty,
+      targetProductId: target.id, targetName: target.name, targetQty, yieldPerUnit, unitCost,
+      createdBy: user.username,
+    };
+    const next = { ...data, products, repacks: [entry, ...data.repacks], counters: { ...data.counters, repack: data.counters.repack + 1 } };
+    setData(next); save(next);
+    setForm(blank); setShowForm(false);
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-lg font-semibold text-[#1F2428]">Repackaging</h2>
+        <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Repack stock</Btn>
+      </div>
+      <p className="text-sm text-slate-500 mb-4">Break a larger unit (e.g. a box of 1000) down into a smaller product you sell separately (e.g. a packet of 100). Each still needs its own product code — this just moves stock and cost between them.</p>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+            <tr><th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Source</th>
+              <th className="text-left px-3 py-2">Produced</th><th className="text-right px-3 py-2">New unit cost</th><th className="text-left px-3 py-2">By</th></tr>
+          </thead>
+          <tbody>
+            {data.repacks.map((r) => (
+              <tr key={r.id} className="border-t border-slate-100">
+                <td className="px-3 py-2 font-mono text-xs">{r.number}</td>
+                <td className="px-3 py-2">{r.date}</td>
+                <td className="px-3 py-2">{r.sourceQty} × {r.sourceName}</td>
+                <td className="px-3 py-2">{r.targetQty} × {r.targetName}</td>
+                <td className="px-3 py-2 text-right font-mono">{money(r.unitCost)}</td>
+                <td className="px-3 py-2 text-slate-500 font-mono text-xs">{r.createdBy}</td>
+              </tr>
+            ))}
+            {data.repacks.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">No repackaging recorded yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {showForm && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4" onClick={() => setShowForm(false)}>
+          <div className="bg-white rounded-lg w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="font-semibold">Repack stock</h2>
+              <button onClick={() => setShowForm(false)}><X size={18} className="text-slate-400" /></button>
+            </div>
+            <form onSubmit={submit} className="space-y-3">
+              <Field label="Source product (the larger unit you're breaking down)">
+                <ProductPicker products={data.products} value={form.sourceProductId} onChange={(id) => setForm({ ...form, sourceProductId: id })} />
+              </Field>
+              <Field label="How many of the source to break down"><input type="number" min="1" className={inputCls} value={form.sourceQty} onChange={(e) => setForm({ ...form, sourceQty: e.target.value })} /></Field>
+              <Field label="Target product (the smaller unit you sell)">
+                <ProductPicker products={data.products} value={form.targetProductId} onChange={(id) => setForm({ ...form, targetProductId: id })} />
+              </Field>
+              <Field label="Target units produced per 1 source unit"><input type="number" min="1" className={inputCls} value={form.yieldPerUnit} onChange={(e) => setForm({ ...form, yieldPerUnit: e.target.value })} /></Field>
+              {source && target && sourceQty > 0 && yieldPerUnit > 0 && (
+                <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-md p-2">
+                  This removes <span className="font-mono">{sourceQty}</span> × {source.name} from stock and adds <span className="font-mono">{targetQty}</span> × {target.name}, at a new cost of {money((source.costPrice * sourceQty) / (targetQty || 1))} per {target.name}.
+                </div>
+              )}
+              <div className="flex justify-end gap-2 pt-2">
+                <Btn variant="ghost" onClick={() => setShowForm(false)}>Cancel</Btn>
+                <Btn type="submit"><Check size={14} /> Save</Btn>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StockHub({ data, setData, save, user }) {
   const allowedTabs = REGISTERS.stock.filter((t) => canAccessRegister(user, "stock", t.id));
   const [tab, setTab] = useState(allowedTabs[0] ? allowedTabs[0].id : "levels");
@@ -851,6 +965,7 @@ function StockHub({ data, setData, save, user }) {
         <>
           <TabBar tabs={allowedTabs} active={tab} onChange={setTab} />
           {tab === "levels" && <StockLevels data={data} setData={setData} save={save} />}
+          {tab === "repack" && <RepackRegister data={data} setData={setData} save={save} user={user} />}
           {tab === "returns" && <GoodsReturnsRegister data={data} setData={setData} save={save} user={user} />}
         </>
       )}
@@ -901,6 +1016,7 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
   const [current, setCurrent] = useState(null);
   const [customer, setCustomer] = useState("");
   const [items, setItems] = useState([]);
+  const [filterDate, setFilterDate] = useState(todayISO());
   const openNew = () => { setCustomer(""); setItems([]); setCurrent(null); setMode("form"); };
   const openView = (q) => { setCurrent(q); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
@@ -997,10 +1113,13 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
   }
 
   return (
-    <DocList title="Quotations" subtitle="Draft quotes for customers, then convert to a sales order."
-      docs={data.quotes} columns={["Number", "Date", "Customer", "Total", "Status"]}
-      onNew={openNew} onOpen={openView}
-      renderTag={(d) => <Tag tone={d.status === "converted" ? "good" : "pending"}>{d.status}</Tag>} />
+    <div>
+      <DateFilterBar date={filterDate} setDate={setFilterDate} />
+      <DocList title="Quotations" subtitle={`Showing quotations for ${formatDateLabel(filterDate)}. Draft quotes for customers, then convert to a sales order.`}
+        docs={data.quotes.filter((q) => q.date === filterDate)} columns={["Number", "Date", "Customer", "Total", "Status"]}
+        onNew={openNew} onOpen={openView}
+        renderTag={(d) => <Tag tone={d.status === "converted" ? "good" : "pending"}>{d.status}</Tag>} />
+    </div>
   );
 }
 
@@ -1013,6 +1132,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
   const [customer, setCustomer] = useState("");
   const [items, setItems] = useState([]);
   const [paymentType, setPaymentType] = useState("cash");
+  const [filterDate, setFilterDate] = useState(todayISO());
   const openNew = () => { setCustomer(""); setItems([]); setPaymentType("cash"); setMode("form"); };
   const openView = (d) => { setCurrent(d); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
@@ -1123,46 +1243,51 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     );
   }
 
-  return <DocList title="Sales Orders" subtitle="Confirmed sales — saving one removes stock automatically. Can't exceed what's in stock."
-    docs={data.salesOrders} columns={["Number", "Date", "Customer", "Total"]} onNew={openNew} onOpen={openView}
-    renderTag={(d) => d.paymentType === "credit" ? <Tag tone={d.paidStatus === "paid" ? "good" : "danger"}>Credit · {d.paidStatus}</Tag> : <Tag tone="good">Cash</Tag>} />;
+  return (
+    <div>
+      <DateFilterBar date={filterDate} setDate={setFilterDate} />
+      <DocList title="Sales Orders" subtitle={`Showing orders for ${formatDateLabel(filterDate)}. Saving one removes stock automatically — can't exceed what's in stock.`}
+        docs={data.salesOrders.filter((o) => o.date === filterDate)} columns={["Number", "Date", "Customer", "Total"]} onNew={openNew} onOpen={openView}
+        renderTag={(d) => d.paymentType === "credit" ? <Tag tone={d.paidStatus === "paid" ? "good" : "danger"}>Credit · {d.paidStatus}</Tag> : <Tag tone="good">Cash</Tag>} />
+    </div>
+  );
 }
 
 /* ---------------------------------------------------------
    Daily Creditors Report (Sales)
 --------------------------------------------------------- */
 function DailyCreditorsReport({ data }) {
-  const creditOrders = data.salesOrders.filter((o) => o.paymentType === "credit");
-  const rows = useMemo(() => {
-    const map = {};
-    creditOrders.forEach((o) => {
-      if (!map[o.date]) map[o.date] = { date: o.date, total: 0, outstanding: 0, count: 0 };
-      map[o.date].total += o.total;
-      map[o.date].outstanding += o.paidStatus === "paid" ? 0 : o.total;
-      map[o.date].count += 1;
-    });
-    return Object.values(map).sort((a, b) => (a.date < b.date ? 1 : -1));
-  }, [creditOrders]);
+  const [filterDate, setFilterDate] = useState(todayISO());
+  const rows = useMemo(() => data.salesOrders
+    .filter((o) => o.paymentType === "credit" && o.date === filterDate)
+    .map((o) => ({ ...o, days: daysSince(o.date) })), [data.salesOrders, filterDate]);
+  const total = rows.reduce((s, r) => s + r.total, 0);
+  const outstanding = rows.filter((r) => r.paidStatus !== "paid").reduce((s, r) => s + r.total, 0);
 
   return (
     <div>
       <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Daily Creditors Report</h2>
-      <p className="text-sm text-slate-500 mb-4">Credit sales by day, and how much of each day's credit is still outstanding.</p>
+      <p className="text-sm text-slate-500 mb-4">Credit sales for {formatDateLabel(filterDate)}, and how much is still outstanding. For every unpaid invoice company-wide, see Accounting → Creditors Report.</p>
+      <DateFilterBar date={filterDate} setDate={setFilterDate} />
+      <div className="flex gap-3 mb-4">
+        <div className="border border-slate-200 rounded-lg p-4 bg-white"><div className="text-[11px] font-mono uppercase text-slate-400 mb-1">Credit sales</div><div className="text-xl font-semibold">{money(total)}</div></div>
+        <div className="border border-slate-200 rounded-lg p-4 bg-white"><div className="text-[11px] font-mono uppercase text-slate-400 mb-1">Still outstanding</div><div className="text-xl font-semibold text-red-600">{money(outstanding)}</div></div>
+      </div>
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
-            <tr><th className="text-left px-3 py-2">Date</th><th className="text-right px-3 py-2">Credit Sales</th><th className="text-right px-3 py-2">Total</th><th className="text-right px-3 py-2">Outstanding</th></tr>
+            <tr><th className="text-left px-3 py-2">Invoice Number</th><th className="text-left px-3 py-2">Customer</th><th className="text-right px-3 py-2">Amount</th><th className="text-left px-3 py-2">Status</th></tr>
           </thead>
           <tbody>
             {rows.map((r) => (
-              <tr key={r.date} className="border-t border-slate-100">
-                <td className="px-3 py-2">{r.date}</td>
-                <td className="px-3 py-2 text-right font-mono">{r.count}</td>
+              <tr key={r.id} className="border-t border-slate-100">
+                <td className="px-3 py-2 font-mono text-xs">{r.number}</td>
+                <td className="px-3 py-2">{r.customer}</td>
                 <td className="px-3 py-2 text-right font-mono">{money(r.total)}</td>
-                <td className="px-3 py-2 text-right font-mono text-red-600">{money(r.outstanding)}</td>
+                <td className="px-3 py-2"><Tag tone={r.paidStatus === "paid" ? "good" : "danger"}>{r.paidStatus}</Tag></td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={4} className="text-center text-slate-400 py-8 text-sm">No credit sales recorded yet.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={4} className="text-center text-slate-400 py-8 text-sm">No credit sales on this date.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1265,9 +1390,10 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
 --------------------------------------------------------- */
 function TransferOutRegister({ data, setData, save, user }) {
   const [showForm, setShowForm] = useState(false);
+  const [filterDate, setFilterDate] = useState(todayISO());
   const blank = { productId: "", qty: 1, party: "", notes: "" };
   const [form, setForm] = useState(blank);
-  const outTransfers = data.transfers.filter((t) => t.type === "out");
+  const outTransfers = data.transfers.filter((t) => t.type === "out" && t.date === filterDate);
 
   const submit = (e) => {
     e.preventDefault();
@@ -1292,7 +1418,8 @@ function TransferOutRegister({ data, setData, save, user }) {
         <h2 className="text-lg font-semibold text-[#1F2428]">Internal Transfer Out</h2>
         <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Record transfer out</Btn>
       </div>
-      <p className="text-sm text-slate-500 mb-4">Stock lent out (e.g. to a friend) — removed from stock at cost. No profit is recorded.</p>
+      <p className="text-sm text-slate-500 mb-4">Showing transfers for {formatDateLabel(filterDate)}. Stock lent out (e.g. to a friend) — removed from stock at cost. No profit is recorded.</p>
+      <DateFilterBar date={filterDate} setDate={setFilterDate} />
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
@@ -1311,7 +1438,7 @@ function TransferOutRegister({ data, setData, save, user }) {
                 <td className="px-3 py-2 text-slate-500">{t.notes}</td>
               </tr>
             ))}
-            {outTransfers.length === 0 && <tr><td colSpan={7} className="text-center text-slate-400 py-8 text-sm">No outgoing transfers yet.</td></tr>}
+            {outTransfers.length === 0 && <tr><td colSpan={7} className="text-center text-slate-400 py-8 text-sm">No outgoing transfers on this date.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1418,21 +1545,23 @@ function TransferInRegister({ data, setData, save, user }) {
 }
 
 /* ---------------------------------------------------------
-   Daily Sales Report — full list, split by Cash / Credit, totals below
+   Daily Sales Report — a single day's orders, split by Cash / Credit, totals below
 --------------------------------------------------------- */
 function DailySalesReport({ data }) {
-  const rows = [...data.salesOrders].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const [filterDate, setFilterDate] = useState(todayISO());
+  const rows = data.salesOrders.filter((o) => o.date === filterDate);
   const totalCash = rows.filter((o) => o.paymentType !== "credit").reduce((s, o) => s + o.total, 0);
   const totalCredit = rows.filter((o) => o.paymentType === "credit").reduce((s, o) => s + o.total, 0);
   return (
     <div>
       <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Daily Sales Report</h2>
-      <p className="text-sm text-slate-500 mb-4">Every sales order, split by cash and credit, before any expenses.</p>
+      <p className="text-sm text-slate-500 mb-4">Sales orders for {formatDateLabel(filterDate)}, split by cash and credit, before any expenses.</p>
+      <DateFilterBar date={filterDate} setDate={setFilterDate} />
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
             <tr>
-              <th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Customer</th>
+              <th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Customer</th>
               <th className="text-right px-3 py-2">Cash</th><th className="text-right px-3 py-2">Credit</th><th className="text-right px-3 py-2">Total</th>
             </tr>
           </thead>
@@ -1440,22 +1569,79 @@ function DailySalesReport({ data }) {
             {rows.map((o) => (
               <tr key={o.id} className="border-t border-slate-100">
                 <td className="px-3 py-2 font-mono text-xs">{o.number}</td>
-                <td className="px-3 py-2">{o.date}</td>
                 <td className="px-3 py-2">{o.customer}</td>
                 <td className="px-3 py-2 text-right font-mono">{o.paymentType === "credit" ? "—" : money(o.total)}</td>
                 <td className="px-3 py-2 text-right font-mono">{o.paymentType === "credit" ? money(o.total) : "—"}</td>
                 <td className="px-3 py-2 text-right font-mono font-medium">{money(o.total)}</td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">No sales recorded yet.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm">No sales on this date.</td></tr>}
           </tbody>
           {rows.length > 0 && (
             <tfoot>
               <tr className="border-t-2 border-slate-300 bg-slate-50 font-semibold">
-                <td colSpan={3} className="px-3 py-2">Totals</td>
+                <td colSpan={2} className="px-3 py-2">Totals</td>
                 <td className="px-3 py-2 text-right font-mono text-emerald-700">{money(totalCash)}</td>
                 <td className="px-3 py-2 text-right font-mono text-amber-700">{money(totalCredit)}</td>
                 <td className="px-3 py-2 text-right font-mono">{money(totalCash + totalCredit)}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   Daily Items Sold — every line item sold on a chosen date,
+   aggregated per product
+--------------------------------------------------------- */
+function DailyItemsSoldReport({ data }) {
+  const [filterDate, setFilterDate] = useState(todayISO());
+  const rows = useMemo(() => {
+    const map = {};
+    data.salesOrders.filter((o) => o.date === filterDate).forEach((o) => {
+      o.items.forEach((l) => {
+        const p = data.products.find((p) => p.id === l.productId);
+        const name = p ? p.name : "—";
+        if (!map[l.productId]) map[l.productId] = { productId: l.productId, name, sku: p ? p.sku : "", qty: 0, revenue: 0 };
+        map[l.productId].qty += l.qty;
+        map[l.productId].revenue += l.qty * l.price;
+      });
+    });
+    return Object.values(map).sort((a, b) => b.revenue - a.revenue);
+  }, [data.salesOrders, data.products, filterDate]);
+  const totalQty = rows.reduce((s, r) => s + r.qty, 0);
+  const totalRevenue = rows.reduce((s, r) => s + r.revenue, 0);
+
+  return (
+    <div>
+      <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Daily Items Sold</h2>
+      <p className="text-sm text-slate-500 mb-4">Every item sold on {formatDateLabel(filterDate)}, combined across all that day's sales orders.</p>
+      <DateFilterBar date={filterDate} setDate={setFilterDate} />
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+            <tr><th className="text-left px-3 py-2">Product</th><th className="text-left px-3 py-2">Code</th><th className="text-right px-3 py-2">Qty Sold</th><th className="text-right px-3 py-2">Revenue</th></tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.productId} className="border-t border-slate-100">
+                <td className="px-3 py-2 font-medium">{r.name}</td>
+                <td className="px-3 py-2 font-mono text-xs text-slate-500">{r.sku}</td>
+                <td className="px-3 py-2 text-right font-mono">{r.qty}</td>
+                <td className="px-3 py-2 text-right font-mono">{money(r.revenue)}</td>
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colSpan={4} className="text-center text-slate-400 py-8 text-sm">No items sold on this date.</td></tr>}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot>
+              <tr className="border-t-2 border-slate-300 bg-slate-50 font-semibold">
+                <td colSpan={2} className="px-3 py-2">Totals</td>
+                <td className="px-3 py-2 text-right font-mono">{totalQty}</td>
+                <td className="px-3 py-2 text-right font-mono">{money(totalRevenue)}</td>
               </tr>
             </tfoot>
           )}
@@ -1470,8 +1656,11 @@ function DailySalesReport({ data }) {
 --------------------------------------------------------- */
 function DailyExpenseRegister({ data, setData, save, user }) {
   const [showForm, setShowForm] = useState(false);
+  const [filterDate, setFilterDate] = useState(todayISO());
   const blank = { date: todayISO(), category: "", description: "", amount: 0 };
   const [form, setForm] = useState(blank);
+
+  const openNew = () => { setForm({ ...blank, date: filterDate }); setShowForm(true); };
 
   const submit = (e) => {
     e.preventDefault();
@@ -1486,55 +1675,38 @@ function DailyExpenseRegister({ data, setData, save, user }) {
     setData(next); save(next);
   };
 
-  const daily = useMemo(() => {
-    const map = {};
-    data.expenses.forEach((e) => {
-      if (!map[e.date]) map[e.date] = { date: e.date, total: 0, count: 0 };
-      map[e.date].total += e.amount;
-      map[e.date].count += 1;
-    });
-    return Object.values(map).sort((a, b) => (a.date < b.date ? 1 : -1));
-  }, [data.expenses]);
+  const dayEntries = data.expenses.filter((e) => e.date === filterDate);
+  const dayTotal = dayEntries.reduce((s, e) => s + e.amount, 0);
 
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
         <h2 className="text-lg font-semibold text-[#1F2428]">Daily Expense Report</h2>
-        <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Add expense</Btn>
+        <Btn onClick={openNew}><Plus size={14} /> Add expense</Btn>
       </div>
-      <p className="text-sm text-slate-500 mb-4">All expenses, grouped by day.</p>
+      <p className="text-sm text-slate-500 mb-4">Expenses for {formatDateLabel(filterDate)}.</p>
+      <DateFilterBar date={filterDate} setDate={setFilterDate} />
 
-      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white mb-5">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
-            <tr><th className="text-left px-3 py-2">Date</th><th className="text-right px-3 py-2">Entries</th><th className="text-right px-3 py-2">Total</th></tr>
-          </thead>
-          <tbody>
-            {daily.map((r) => (
-              <tr key={r.date} className="border-t border-slate-100"><td className="px-3 py-2">{r.date}</td><td className="px-3 py-2 text-right font-mono">{r.count}</td><td className="px-3 py-2 text-right font-mono">{money(r.total)}</td></tr>
-            ))}
-            {daily.length === 0 && <tr><td colSpan={3} className="text-center text-slate-400 py-6 text-sm">No expenses recorded yet.</td></tr>}
-          </tbody>
-        </table>
+      <div className="border border-slate-200 rounded-lg p-4 bg-white mb-4 inline-block">
+        <div className="text-[11px] font-mono uppercase text-slate-400 mb-1">Total for this date</div>
+        <div className="text-xl font-semibold">{money(dayTotal)}</div>
       </div>
 
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
-        <div className="px-4 py-2.5 border-b border-slate-100 text-sm font-medium">All entries</div>
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
-            <tr><th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Category</th><th className="text-left px-3 py-2">Description</th><th className="text-right px-3 py-2">Amount</th><th className="w-10"></th></tr>
+            <tr><th className="text-left px-3 py-2">Category</th><th className="text-left px-3 py-2">Description</th><th className="text-right px-3 py-2">Amount</th><th className="w-10"></th></tr>
           </thead>
           <tbody>
-            {data.expenses.map((e) => (
+            {dayEntries.map((e) => (
               <tr key={e.id} className="border-t border-slate-100">
-                <td className="px-3 py-2">{e.date}</td>
                 <td className="px-3 py-2"><Tag>{e.category || "Other"}</Tag></td>
                 <td className="px-3 py-2 text-slate-600">{e.description}</td>
                 <td className="px-3 py-2 text-right font-mono">{money(e.amount)}</td>
                 <td className="px-3 py-2 text-right"><button onClick={() => removeExpense(e.id)} className="text-slate-400 hover:text-red-600"><Trash2 size={14} /></button></td>
               </tr>
             ))}
-            {data.expenses.length === 0 && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm">No expenses recorded yet.</td></tr>}
+            {dayEntries.length === 0 && <tr><td colSpan={4} className="text-center text-slate-400 py-8 text-sm">No expenses on this date.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1879,6 +2051,7 @@ function SalesHub({ data, setData, save, setPrintJob, user }) {
           {tab === "orders" && <SalesOrderModule data={data} setData={setData} save={save} setPrintJob={setPrintJob} user={user} />}
           {tab === "quotes" && <QuotationModule data={data} setData={setData} save={save} setPrintJob={setPrintJob} user={user} />}
           {tab === "transferOut" && <TransferOutRegister data={data} setData={setData} save={save} user={user} />}
+          {tab === "dailyItems" && <DailyItemsSoldReport data={data} />}
           {tab === "dailySales" && <DailySalesReport data={data} />}
           {tab === "dailyExpense" && <DailyExpenseRegister data={data} setData={setData} save={save} user={user} />}
           {tab === "cashBook" && <DailyCashBook data={data} />}
