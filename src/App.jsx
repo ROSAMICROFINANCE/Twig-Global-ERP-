@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-  signOut
+  signOut, setPersistence, browserSessionPersistence
 } from "firebase/auth";
 import {
   doc, getDoc, setDoc, onSnapshot, collection, deleteDoc
@@ -57,6 +57,7 @@ const REGISTERS = {
     { id: "orders", label: "Sales Orders" },
     { id: "quotes", label: "Quotations" },
     { id: "transferOut", label: "Internal Transfer Out" },
+    { id: "loanReturns", label: "Internal Transfer In (Return)" },
     { id: "dailyItems", label: "Daily Items Sold" },
     { id: "dailySales", label: "Daily Sales Report" },
     { id: "dailyExpense", label: "Daily Expense Report" },
@@ -65,7 +66,7 @@ const REGISTERS = {
   ],
   purchase: [
     { id: "orders", label: "Purchase Orders" },
-    { id: "transferIn", label: "Internal Transfer In" },
+    { id: "transferIn", label: "Borrowed From Outside" },
     { id: "dailyPurchase", label: "Daily Purchase Report" },
   ],
   stock: [
@@ -82,8 +83,8 @@ const REGISTERS = {
 };
 
 const emptyData = () => ({
-  products: [], quotes: [], salesOrders: [], purchaseOrders: [], transfers: [], expenses: [], returns: [], payments: [], repacks: [],
-  counters: { quote: 1, sales: 1, purchase: 1, transfer: 1, exp: 1, ret: 1, product: 1, pay: 1, repack: 1 },
+  products: [], quotes: [], salesOrders: [], purchaseOrders: [], transfers: [], expenses: [], returns: [], payments: [], repacks: [], loanReturns: [],
+  counters: { quote: 1, sales: 1, purchase: 1, transfer: 1, exp: 1, ret: 1, product: 1, pay: 1, repack: 1, loanReturn: 1 },
   invoiceSettings: { shopName: "", tagline: "", phone: "", footerNote: "", logoDataUrl: "" },
 });
 
@@ -1395,6 +1396,13 @@ function TransferOutRegister({ data, setData, save, user }) {
   const [form, setForm] = useState(blank);
   const outTransfers = data.transfers.filter((t) => t.type === "out" && t.date === filterDate);
 
+  const loanStatus = (t) => {
+    const returned = (data.loanReturns || []).filter((r) => r.transferOutId === t.id).reduce((s, r) => s + r.qty, 0);
+    const remaining = t.qty - returned;
+    const status = remaining <= 0 ? "Fully returned" : returned > 0 ? "Partially returned" : "Outstanding";
+    return { returned, remaining, status };
+  };
+
   const submit = (e) => {
     e.preventDefault();
     const product = data.products.find((p) => p.id === form.productId);
@@ -1418,27 +1426,33 @@ function TransferOutRegister({ data, setData, save, user }) {
         <h2 className="text-lg font-semibold text-[#1F2428]">Internal Transfer Out</h2>
         <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Record transfer out</Btn>
       </div>
-      <p className="text-sm text-slate-500 mb-4">Showing transfers for {formatDateLabel(filterDate)}. Stock lent out (e.g. to a friend) — removed from stock at cost. No profit is recorded.</p>
+      <p className="text-sm text-slate-500 mb-4">Showing transfers for {formatDateLabel(filterDate)}. Stock sent out (e.g. to a friend) — removed from stock at cost, no profit recorded. Status updates automatically once it comes back via Internal Transfer In (Return).</p>
       <DateFilterBar date={filterDate} setDate={setFilterDate} />
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
-            <tr><th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Product</th>
-              <th className="text-right px-3 py-2">Qty</th><th className="text-left px-3 py-2">To</th><th className="text-right px-3 py-2">Value (cost)</th><th className="text-left px-3 py-2">Notes</th></tr>
+            <tr><th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Product</th>
+              <th className="text-right px-3 py-2">Qty Out</th><th className="text-left px-3 py-2">To</th><th className="text-right px-3 py-2">Value (cost)</th><th className="text-left px-3 py-2">Status</th></tr>
           </thead>
           <tbody>
-            {outTransfers.map((t) => (
-              <tr key={t.id} className="border-t border-slate-100">
-                <td className="px-3 py-2 font-mono text-xs">{t.number}</td>
-                <td className="px-3 py-2">{t.date}</td>
-                <td className="px-3 py-2">{t.productName}</td>
-                <td className="px-3 py-2 text-right font-mono">{t.qty}</td>
-                <td className="px-3 py-2">{t.party}</td>
-                <td className="px-3 py-2 text-right font-mono">{money(t.valueAtCost)}</td>
-                <td className="px-3 py-2 text-slate-500">{t.notes}</td>
-              </tr>
-            ))}
-            {outTransfers.length === 0 && <tr><td colSpan={7} className="text-center text-slate-400 py-8 text-sm">No outgoing transfers on this date.</td></tr>}
+            {outTransfers.map((t) => {
+              const { remaining, status } = loanStatus(t);
+              return (
+                <tr key={t.id} className="border-t border-slate-100">
+                  <td className="px-3 py-2 font-mono text-xs">{t.number}</td>
+                  <td className="px-3 py-2">{t.productName}</td>
+                  <td className="px-3 py-2 text-right font-mono">{t.qty}</td>
+                  <td className="px-3 py-2">{t.party}</td>
+                  <td className="px-3 py-2 text-right font-mono">{money(t.valueAtCost)}</td>
+                  <td className="px-3 py-2">
+                    <Tag tone={status === "Fully returned" ? "good" : status === "Partially returned" ? "pending" : "low"}>
+                      {status}{status !== "Fully returned" ? ` · ${remaining} left` : ""}
+                    </Tag>
+                  </td>
+                </tr>
+              );
+            })}
+            {outTransfers.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">No outgoing transfers on this date.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1467,7 +1481,107 @@ function TransferOutRegister({ data, setData, save, user }) {
 }
 
 /* ---------------------------------------------------------
-   Internal Transfer In (Purchase)
+   Loan Returns (Sales) — return of OUR stock that was lent
+   out; always links back to a specific Transfer Out entry.
+--------------------------------------------------------- */
+function LoanReturnsRegister({ data, setData, save, user }) {
+  const [showForm, setShowForm] = useState(false);
+  const blank = { transferOutId: "", qty: 1, notes: "" };
+  const [form, setForm] = useState(blank);
+
+  const withRemaining = (t) => {
+    const returned = (data.loanReturns || []).filter((r) => r.transferOutId === t.id).reduce((s, r) => s + r.qty, 0);
+    return { ...t, returned, remaining: t.qty - returned };
+  };
+  const outstandingLoans = data.transfers.filter((t) => t.type === "out").map(withRemaining).filter((t) => t.remaining > 0);
+  const selectedLoan = outstandingLoans.find((t) => t.id === form.transferOutId);
+
+  const submit = (e) => {
+    e.preventDefault();
+    const loan = data.transfers.find((t) => t.id === form.transferOutId);
+    if (!loan) { alert("Select which transfer out this is returning."); return; }
+    const product = data.products.find((p) => p.id === loan.productId);
+    if (!product) return;
+    const qty = Number(form.qty) || 0;
+    const remaining = withRemaining(loan).remaining;
+    if (qty <= 0 || qty > remaining) { alert(`Enter a quantity between 1 and ${remaining} (what's still outstanding on this transfer).`); return; }
+    const entry = {
+      id: uid(), number: nextNumber("LNR", data.counters.loanReturn), date: todayISO(),
+      transferOutId: loan.id, transferOutNumber: loan.number, productId: product.id, productName: product.name,
+      party: loan.party, qty, notes: form.notes, valueAtCost: qty * product.costPrice, createdBy: user.username,
+    };
+    const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
+    const next = { ...data, products, loanReturns: [entry, ...(data.loanReturns || [])], counters: { ...data.counters, loanReturn: data.counters.loanReturn + 1 } };
+    setData(next); save(next);
+    setForm(blank); setShowForm(false);
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-lg font-semibold text-[#1F2428]">Internal Transfer In (Return)</h2>
+        <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Record a return</Btn>
+      </div>
+      <p className="text-sm text-slate-500 mb-4">Stock we sent out, coming back. Every entry here must link to a specific outstanding transfer out — partial returns are tracked until fully closed out.</p>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+            <tr><th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Transfer Out #</th>
+              <th className="text-left px-3 py-2">Product</th><th className="text-left px-3 py-2">From</th><th className="text-right px-3 py-2">Qty Returned</th></tr>
+          </thead>
+          <tbody>
+            {(data.loanReturns || []).map((r) => (
+              <tr key={r.id} className="border-t border-slate-100">
+                <td className="px-3 py-2 font-mono text-xs">{r.number}</td>
+                <td className="px-3 py-2">{r.date}</td>
+                <td className="px-3 py-2 font-mono text-xs">{r.transferOutNumber}</td>
+                <td className="px-3 py-2">{r.productName}</td>
+                <td className="px-3 py-2">{r.party}</td>
+                <td className="px-3 py-2 text-right font-mono">{r.qty}</td>
+              </tr>
+            ))}
+            {(!data.loanReturns || data.loanReturns.length === 0) && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">No returns recorded yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {showForm && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4" onClick={() => setShowForm(false)}>
+          <div className="bg-white rounded-lg w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="font-semibold">Record a return</h2>
+              <button onClick={() => setShowForm(false)}><X size={18} className="text-slate-400" /></button>
+            </div>
+            <form onSubmit={submit} className="space-y-3">
+              <Field label="Which transfer out is this returning?">
+                <select required className={inputCls} value={form.transferOutId} onChange={(e) => setForm({ ...form, transferOutId: e.target.value, qty: 1 })}>
+                  <option value="">Select an outstanding transfer…</option>
+                  {outstandingLoans.map((t) => (
+                    <option key={t.id} value={t.id}>{t.qty} × {t.productName} — to {t.party} — {t.remaining} still out</option>
+                  ))}
+                </select>
+                {outstandingLoans.length === 0 && <p className="text-xs text-slate-400 mt-1">Nothing is currently out.</p>}
+              </Field>
+              {selectedLoan && (
+                <Field label={`Quantity returning now (max ${selectedLoan.remaining})`}>
+                  <input type="number" min="1" max={selectedLoan.remaining} className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} />
+                </Field>
+              )}
+              <Field label="Notes"><input className={inputCls} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>
+              <div className="flex justify-end gap-2 pt-2">
+                <Btn variant="ghost" onClick={() => setShowForm(false)}>Cancel</Btn>
+                <Btn type="submit" disabled={!selectedLoan}><Check size={14} /> Save</Btn>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   Borrowed From Outside (Purchase) — stock WE borrow from
+   someone else, added to stock. Free-form, no link required.
 --------------------------------------------------------- */
 function TransferInRegister({ data, setData, save, user }) {
   const [showForm, setShowForm] = useState(false);
@@ -1494,10 +1608,10 @@ function TransferInRegister({ data, setData, save, user }) {
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
-        <h2 className="text-lg font-semibold text-[#1F2428]">Internal Transfer In</h2>
-        <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Record transfer in</Btn>
+        <h2 className="text-lg font-semibold text-[#1F2428]">Borrowed From Outside</h2>
+        <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Record stock borrowed in</Btn>
       </div>
-      <p className="text-sm text-slate-500 mb-4">Stock returned into the system — added back to stock at cost.</p>
+      <p className="text-sm text-slate-500 mb-4">Stock we've borrowed from someone else — added to our stock at cost. This is separate from our own stock coming back from a transfer out (that's Sales → Internal Transfer In (Return)).</p>
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
@@ -1958,7 +2072,7 @@ function IncomeStatement({ data }) {
       </div>
       {outOnLoan !== 0 && (
         <p className="text-xs text-slate-400 mt-3 max-w-lg">
-          Informational only — not included above: {money(Math.abs(outOnLoan))} of stock currently {outOnLoan > 0 ? "out on internal loan and not yet returned" : "returned in excess of what's on loan"}.
+          Informational only — not included above: {money(Math.abs(outOnLoan))} of stock currently {outOnLoan > 0 ? "out on internal transfer and not yet returned" : "returned in excess of what's currently outstanding"}.
         </p>
       )}
     </div>
@@ -2051,6 +2165,7 @@ function SalesHub({ data, setData, save, setPrintJob, user }) {
           {tab === "orders" && <SalesOrderModule data={data} setData={setData} save={save} setPrintJob={setPrintJob} user={user} />}
           {tab === "quotes" && <QuotationModule data={data} setData={setData} save={save} setPrintJob={setPrintJob} user={user} />}
           {tab === "transferOut" && <TransferOutRegister data={data} setData={setData} save={save} user={user} />}
+          {tab === "loanReturns" && <LoanReturnsRegister data={data} setData={setData} save={save} user={user} />}
           {tab === "dailyItems" && <DailyItemsSoldReport data={data} />}
           {tab === "dailySales" && <DailySalesReport data={data} />}
           {tab === "dailyExpense" && <DailyExpenseRegister data={data} setData={setData} save={save} user={user} />}
@@ -2438,6 +2553,12 @@ export default function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [view, setView] = useState("dashboard");
   const [printJob, setPrintJob] = usePrint();
+
+  // Session-only login: closing the tab/browser signs the person out;
+  // reloading the same tab keeps them signed in.
+  useEffect(() => {
+    setPersistence(auth, browserSessionPersistence).catch(() => {});
+  }, []);
 
   useEffect(() => {
     ensureLocationsList();
