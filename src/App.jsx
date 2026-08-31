@@ -332,12 +332,12 @@ function LoginScreen({ firstRun, onLogin, onCreateAdmin, onSignUp, busy }) {
         <p className="text-sm text-slate-500 mb-5">
           {firstRun ? "First time setup — create the admin account." : mode === "signup" ? "Create your account — an admin will grant you access after." : "Sign in to your account."}
         </p>
-        <form onSubmit={submit} className="space-y-3">
+        <form onSubmit={submit} className="space-y-3" autoComplete="off">
           {showNameField && (
-            <Field label="Full name"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} /></Field>
+            <Field label="Full name"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" /></Field>
           )}
-          <Field label="Username"><input className={inputCls} value={username} onChange={(e) => setUsername(e.target.value)} autoCapitalize="none" /></Field>
-          <Field label="Password"><input type="password" className={inputCls} value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+          <Field label="Username"><input className={inputCls} value={username} onChange={(e) => setUsername(e.target.value)} autoCapitalize="none" autoComplete="off" /></Field>
+          <Field label="Password"><input type="password" className={inputCls} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" /></Field>
           {error && <div className="text-xs text-red-600">{error}</div>}
           <Btn type="submit" className="w-full justify-center" disabled={busy}>
             {busy ? <Loader2 size={14} className="animate-spin" /> : firstRun ? <><Shield size={14} /> Create admin account</> : mode === "signup" ? <><Check size={14} /> Create account</> : <><Lock size={14} /> Sign in</>}
@@ -479,6 +479,51 @@ function usePrint() {
     return () => clearTimeout(t);
   }, [printJob]);
   return [printJob, setPrintJob];
+}
+
+/* ---------------------------------------------------------
+   Exit confirmation — pressing the phone/browser back button
+   once shows a warning instead of leaving the site straight
+   away; pressing it again within a couple seconds actually exits.
+--------------------------------------------------------- */
+function useExitConfirm() {
+  const [showWarning, setShowWarning] = useState(false);
+  const armedRef = useRef(false);
+  const timerRef = useRef(null);
+
+  useEffect(() => {
+    window.history.pushState({ twigGuard: true }, "");
+    const onPopState = () => {
+      if (armedRef.current) {
+        // Second back press in time — let it through, actually exit.
+        armedRef.current = false;
+        clearTimeout(timerRef.current);
+        setShowWarning(false);
+        return;
+      }
+      window.history.pushState({ twigGuard: true }, "");
+      armedRef.current = true;
+      setShowWarning(true);
+      clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        armedRef.current = false;
+        setShowWarning(false);
+      }, 2500);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => { window.removeEventListener("popstate", onPopState); clearTimeout(timerRef.current); };
+  }, []);
+
+  return showWarning;
+}
+
+function ExitWarningToast() {
+  return (
+    <div className="fixed bottom-20 md:bottom-6 left-1/2 -translate-x-1/2 z-[100] bg-[#1F2428] text-white text-sm px-4 py-2.5 rounded-full shadow-lg flex items-center gap-2 print:hidden">
+      <AlertTriangle size={15} className="text-[#D9A441] flex-shrink-0" />
+      Press back again to exit
+    </div>
+  );
 }
 
 /* ---------------------------------------------------------
@@ -2553,6 +2598,7 @@ export default function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [view, setView] = useState("dashboard");
   const [printJob, setPrintJob] = usePrint();
+  const showExitWarning = useExitConfirm();
 
   // Session-only login: closing the tab/browser signs the person out;
   // reloading the same tab keeps them signed in.
@@ -2640,18 +2686,27 @@ export default function App() {
   const handleLogout = () => signOut(auth);
 
   if (!authChecked || !usersLoaded || !locationsLoaded) {
-    return <div className="h-screen flex items-center justify-center bg-[#F4F4F2]"><Loader2 className="animate-spin text-[#2B4C7E]" size={28} /></div>;
+    return <>
+      <div className="h-screen flex items-center justify-center bg-[#F4F4F2]"><Loader2 className="animate-spin text-[#2B4C7E]" size={28} /></div>
+      {showExitWarning && <ExitWarningToast />}
+    </>;
   }
 
   if (!currentUser) {
-    return <LoginScreen firstRun={users.length === 0} onLogin={handleLogin} onCreateAdmin={handleCreateAdmin} onSignUp={handleSignUp} busy={authBusy} />;
+    return <>
+      <LoginScreen firstRun={users.length === 0} onLogin={handleLogin} onCreateAdmin={handleCreateAdmin} onSignUp={handleSignUp} busy={authBusy} />
+      {showExitWarning && <ExitWarningToast />}
+    </>;
   }
 
   const visibleNav = MODULES.filter((m) => canAccess(currentUser, m.id));
   const missingModules = visibleNav.length === 0;
   const missingLocation = myLocations.length === 0;
   if (!currentUser.isAdmin && (missingModules || missingLocation)) {
-    return <AccessPendingScreen user={currentUser} missingModules={missingModules} missingLocation={missingLocation} onLogout={handleLogout} />;
+    return <>
+      <AccessPendingScreen user={currentUser} missingModules={missingModules} missingLocation={missingLocation} onLogout={handleLogout} />
+      {showExitWarning && <ExitWarningToast />}
+    </>;
   }
   if (currentUser.isAdmin) visibleNav.push({ id: "settings", label: "Settings", icon: SettingsIcon });
   const activeView = visibleNav.some((n) => n.id === view) ? view : (visibleNav[0] ? visibleNav[0].id : "dashboard");
@@ -2737,6 +2792,7 @@ export default function App() {
 
       {printJob && printJob.mode === "doc" && <PrintableDoc {...printJob.payload} settings={data.invoiceSettings} footer="Generated by HardwareERP" />}
       {printJob && printJob.mode === "receipt" && <div className="hidden print:block" style={{ width: "58mm" }}><ReceiptDoc {...printJob.payload} settings={data.invoiceSettings} /></div>}
+      {showExitWarning && <ExitWarningToast />}
     </div>
   );
 }
