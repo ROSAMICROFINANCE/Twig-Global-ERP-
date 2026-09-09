@@ -471,6 +471,49 @@ function ReceiptDoc({ number, date, partyName, items, total, settings }) {
   );
 }
 
+/* ---------------------------------------------------------
+   58mm receipt printing via the "Bluetooth Print" Android app
+   (package: mate.bluetoothprint). This bypasses Android's
+   Print Framework entirely — most cheap thermal printers never
+   register as a proper print service, so window.print() can
+   never see them. Instead we hand the app a formatted command
+   string directly through an Android Intent triggered from the
+   browser, exactly the same command format the app's own
+   Intent Print reference documents.
+--------------------------------------------------------- */
+function buildBluetoothPrintText({ number, date, partyName, items, total, settings }) {
+  const s = settings || {};
+  const t = (v) => String(v == null ? "" : v).replace(/[\r\n]+/g, " ");
+  let str = "";
+  str += `<111>${t(s.shopName || "YOUR SHOP")}\n`;
+  if (s.tagline) str += `<010>${t(s.tagline)}\n`;
+  if (s.phone) str += `<010>${t(s.phone)}\n`;
+  str += `<000>--------------------------------\n`;
+  str += `<000>${t(number)}\n`;
+  str += `<000>${t(date)}\n`;
+  if (partyName) str += `<000>Customer: ${t(partyName)}\n`;
+  str += `<000>--------------------------------\n`;
+  items.forEach((l) => {
+    str += `<000>${t(l.name)}\n`;
+    str += `<000>  ${l.qty} x ${Number(l.price).toFixed(2)} = ${(l.qty * l.price).toFixed(2)}\n`;
+  });
+  str += `<000>--------------------------------\n`;
+  str += `<121>TOTAL: ${money(total)}\n`;
+  str += `<010>${t(s.footerNote || "Thank you!")}\n`;
+  str += `<000>\n\n\n`;
+  return str;
+}
+
+function printViaBluetoothPrintApp(payload) {
+  const text = buildBluetoothPrintText(payload);
+  const encoded = encodeURIComponent(text);
+  const fallback = encodeURIComponent(window.location.href);
+  const intentUrl = `intent://print#Intent;action=android.intent.action.SEND;package=mate.bluetoothprint;type=text/plain;S.android.intent.extra.TEXT=${encoded};S.browser_fallback_url=${fallback};end`;
+  window.location.href = intentUrl;
+}
+
+const isAndroid = () => typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+
 function usePrint() {
   const [printJob, setPrintJob] = useState(null);
   useEffect(() => {
@@ -479,6 +522,46 @@ function usePrint() {
     return () => clearTimeout(t);
   }, [printJob]);
   return [printJob, setPrintJob];
+}
+
+/* ---------------------------------------------------------
+   Draft autosave — for forms with real work someone could
+   lose (a network drop, an accidental back-press, closing the
+   tab mid-entry). Saves to this device's local storage as they
+   type, restores it next time they open the same form, and
+   clears itself once the form is actually saved or cancelled.
+--------------------------------------------------------- */
+function useDraft(storageKey, blank) {
+  const draftKey = `twigerp-draft:${storageKey}`;
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem(draftKey);
+      return raw ? JSON.parse(raw) : blank;
+    } catch (e) { return blank; }
+  });
+  const [wasRestored] = useState(() => {
+    try { return !!window.localStorage.getItem(draftKey); } catch (e) { return false; }
+  });
+
+  useEffect(() => {
+    try { window.localStorage.setItem(draftKey, JSON.stringify(value)); } catch (e) {}
+  }, [value, draftKey]);
+
+  const clearDraft = () => {
+    try { window.localStorage.removeItem(draftKey); } catch (e) {}
+  };
+  const discardAndReset = () => { clearDraft(); setValue(blank); };
+
+  return [value, setValue, clearDraft, wasRestored, discardAndReset];
+}
+
+function DraftRestoredNotice({ onDiscard }) {
+  return (
+    <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-300 rounded-md px-3 py-2 mb-4 text-sm text-amber-800">
+      <span>Picking up a draft you didn't finish last time.</span>
+      <button type="button" onClick={onDiscard} className="text-xs underline flex-shrink-0">Discard and start fresh</button>
+    </div>
+  );
 }
 
 /* ---------------------------------------------------------
@@ -1060,10 +1143,15 @@ function DocList({ title, subtitle, docs, columns, onNew, onOpen, renderTag }) {
 function QuotationModule({ data, setData, save, setPrintJob, user }) {
   const [mode, setMode] = useState("list");
   const [current, setCurrent] = useState(null);
-  const [customer, setCustomer] = useState("");
-  const [items, setItems] = useState([]);
+  const blankForm = { customer: "", items: [] };
+  const [form, setForm, clearDraft, draftRestored, discardDraft] = useDraft("quotation", blankForm);
+  const { customer, items } = form;
+  const setCustomer = (v) => setForm({ ...form, customer: v });
+  const setItems = (v) => setForm({ ...form, items: v });
+  const hasDraft = customer.trim() !== "" || items.length > 0;
   const [filterDate, setFilterDate] = useState(todayISO());
-  const openNew = () => { setCustomer(""); setItems([]); setCurrent(null); setMode("form"); };
+  const openNew = () => { setCurrent(null); setMode("form"); };
+  const cancelForm = () => { discardDraft(); setMode("list"); };
   const openView = (q) => { setCurrent(q); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
 
@@ -1073,6 +1161,7 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
     const quote = { id: uid(), number, customer, date: todayISO(), items, total, status: "draft", createdBy: user.username };
     const next = { ...data, quotes: [quote, ...data.quotes], counters: { ...data.counters, quote: data.counters.quote + 1 } };
     setData(next); save(next);
+    clearDraft(); setForm(blankForm);
     setMode("list");
   };
 
@@ -1108,15 +1197,16 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
     return (
       <div>
         <div className="flex items-center gap-2 mb-4 text-sm text-slate-500">
-          <button onClick={() => setMode("list")} className="hover:text-[#2B4C7E]">Quotations</button><ChevronRight size={13} /> <span className="text-slate-800">New quotation</span>
+          <button onClick={cancelForm} className="hover:text-[#2B4C7E]">Quotations</button><ChevronRight size={13} /> <span className="text-slate-800">New quotation</span>
         </div>
+        {draftRestored && hasDraft && <DraftRestoredNotice onDiscard={discardDraft} />}
         <form onSubmit={submit} className="space-y-4 max-w-3xl">
           <Field label="Customer name"><input required className={inputCls} value={customer} onChange={(e) => setCustomer(e.target.value)} /></Field>
           <LineItemsEditor items={items} setItems={setItems} products={data.products} priceField="sellPrice" />
-          <p className="text-xs text-slate-400">Quotations can list more than what's currently in stock — the stock check only applies once you convert this to a sales order.</p>
+          <p className="text-xs text-slate-400">Quotations can list more than what's currently in stock — the stock check only applies once you convert this to a sales order. Your progress here is saved automatically in case the connection drops or the app closes.</p>
           <div className="flex justify-between items-center">
             <div className="text-lg font-semibold">Total: {money(total)}</div>
-            <div className="flex gap-2"><Btn variant="ghost" onClick={() => setMode("list")}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save quotation</Btn></div>
+            <div className="flex gap-2"><Btn variant="ghost" onClick={cancelForm}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save quotation</Btn></div>
           </div>
         </form>
       </div>
@@ -1175,11 +1265,16 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
 function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
   const [mode, setMode] = useState("list");
   const [current, setCurrent] = useState(null);
-  const [customer, setCustomer] = useState("");
-  const [items, setItems] = useState([]);
-  const [paymentType, setPaymentType] = useState("cash");
+  const blankForm = { customer: "", items: [], paymentType: "cash" };
+  const [form, setForm, clearDraft, draftRestored, discardDraft] = useDraft("sales-order", blankForm);
+  const { customer, items, paymentType } = form;
+  const setCustomer = (v) => setForm({ ...form, customer: v });
+  const setItems = (v) => setForm({ ...form, items: v });
+  const setPaymentType = (v) => setForm({ ...form, paymentType: v });
+  const hasDraft = customer.trim() !== "" || items.length > 0;
   const [filterDate, setFilterDate] = useState(todayISO());
-  const openNew = () => { setCustomer(""); setItems([]); setPaymentType("cash"); setMode("form"); };
+  const openNew = () => { setMode("form"); };
+  const cancelForm = () => { discardDraft(); setMode("list"); };
   const openView = (d) => { setCurrent(d); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
 
@@ -1205,6 +1300,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     const products = data.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: p.stock - l.qty } : p; });
     const next = { ...data, products, salesOrders: [salesOrder, ...data.salesOrders], counters: { ...data.counters, sales: data.counters.sales + 1 } };
     setData(next); save(next);
+    clearDraft(); setForm(blankForm);
     setMode("list");
   };
 
@@ -1221,8 +1317,9 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     return (
       <div>
         <div className="flex items-center gap-2 mb-4 text-sm text-slate-500">
-          <button onClick={() => setMode("list")} className="hover:text-[#2B4C7E]">Sales orders</button><ChevronRight size={13} /> <span className="text-slate-800">New sales order</span>
+          <button onClick={cancelForm} className="hover:text-[#2B4C7E]">Sales orders</button><ChevronRight size={13} /> <span className="text-slate-800">New sales order</span>
         </div>
+        {draftRestored && hasDraft && <DraftRestoredNotice onDiscard={discardDraft} />}
         <form onSubmit={submit} className="space-y-4 max-w-3xl">
           <Field label="Customer name"><input required className={inputCls} value={customer} onChange={(e) => setCustomer(e.target.value)} /></Field>
           <Field label="Payment">
@@ -1236,9 +1333,9 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
           <LineItemsEditor items={items} setItems={setItems} products={data.products} priceField="sellPrice" />
           <div className="flex justify-between items-center">
             <div className="text-lg font-semibold">Total: {money(total)}</div>
-            <div className="flex gap-2"><Btn variant="ghost" onClick={() => setMode("list")}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save — deducts stock</Btn></div>
+            <div className="flex gap-2"><Btn variant="ghost" onClick={cancelForm}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save — deducts stock</Btn></div>
           </div>
-          <p className="text-xs text-slate-400">A sales order can't be saved for more than what's currently in stock. Credit sales appear in the Creditors Report until marked paid.</p>
+          <p className="text-xs text-slate-400">A sales order can't be saved for more than what's currently in stock. Credit sales appear in the Creditors Report until marked paid. Your progress here is saved automatically in case the connection drops or the app closes.</p>
         </form>
       </div>
     );
@@ -1275,10 +1372,14 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
                 partyName: current.customer, items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total,
                 extraLine: `Payment: ${current.paymentType === "credit" ? "Credit" : "Cash"}`
               }})}><Printer size={14} /> Print A4 / PDF</Btn>
-              <Btn onClick={() => setPrintJob({ mode: "receipt", payload: {
+              <Btn onClick={() => printViaBluetoothPrintApp({
                 number: current.number, date: current.date, partyName: current.customer,
-                items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total
-              }})}><Printer size={14} /> Print receipt (58mm)</Btn>
+                items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total,
+                settings: data.invoiceSettings,
+              })} disabled={!isAndroid()} className={!isAndroid() ? "opacity-50" : ""}>
+                <Printer size={14} /> Print receipt (Bluetooth)
+              </Btn>
+              {!isAndroid() && <span className="text-[11px] text-slate-400 self-center">Bluetooth receipt printing works from an Android phone with the Bluetooth Print app installed.</span>}
               {current.paymentType === "credit" && current.paidStatus !== "paid" && (
                 <Btn variant="amber" onClick={() => markPaid(current)}><Check size={14} /> Mark as paid today</Btn>
               )}
@@ -1347,9 +1448,14 @@ function DailyCreditorsReport({ data }) {
 function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
   const [mode, setMode] = useState("list");
   const [current, setCurrent] = useState(null);
-  const [supplier, setSupplier] = useState("");
-  const [items, setItems] = useState([]);
-  const openNew = () => { setSupplier(""); setItems([]); setMode("form"); };
+  const blankForm = { supplier: "", items: [] };
+  const [form, setForm, clearDraft, draftRestored, discardDraft] = useDraft("purchase-order", blankForm);
+  const { supplier, items } = form;
+  const setSupplier = (v) => setForm({ ...form, supplier: v });
+  const setItems = (v) => setForm({ ...form, items: v });
+  const hasDraft = supplier.trim() !== "" || items.length > 0;
+  const openNew = () => { setMode("form"); };
+  const cancelForm = () => { discardDraft(); setMode("list"); };
   const openView = (d) => { setCurrent(d); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
 
@@ -1359,6 +1465,7 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
     const po = { id: uid(), number, supplier, date: todayISO(), items, total, status: "pending", createdBy: user.username };
     const next = { ...data, purchaseOrders: [po, ...data.purchaseOrders], counters: { ...data.counters, purchase: data.counters.purchase + 1 } };
     setData(next); save(next);
+    clearDraft(); setForm(blankForm);
     setMode("list");
   };
 
@@ -1377,14 +1484,16 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
     return (
       <div>
         <div className="flex items-center gap-2 mb-4 text-sm text-slate-500">
-          <button onClick={() => setMode("list")} className="hover:text-[#2B4C7E]">Purchase orders</button><ChevronRight size={13} /> <span className="text-slate-800">New purchase order</span>
+          <button onClick={cancelForm} className="hover:text-[#2B4C7E]">Purchase orders</button><ChevronRight size={13} /> <span className="text-slate-800">New purchase order</span>
         </div>
+        {draftRestored && hasDraft && <DraftRestoredNotice onDiscard={discardDraft} />}
         <form onSubmit={submit} className="space-y-4 max-w-3xl">
           <Field label="Supplier name"><input required className={inputCls} value={supplier} onChange={(e) => setSupplier(e.target.value)} /></Field>
           <LineItemsEditor items={items} setItems={setItems} products={data.products} priceField="costPrice" showCost />
+          <p className="text-xs text-slate-400">Your progress here is saved automatically in case the connection drops or the app closes.</p>
           <div className="flex justify-between items-center">
             <div className="text-lg font-semibold">Total: {money(total)}</div>
-            <div className="flex gap-2"><Btn variant="ghost" onClick={() => setMode("list")}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save purchase order</Btn></div>
+            <div className="flex gap-2"><Btn variant="ghost" onClick={cancelForm}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save purchase order</Btn></div>
           </div>
         </form>
       </div>
