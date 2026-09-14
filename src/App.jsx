@@ -131,7 +131,10 @@ async function ensureLocationDoc(locationId) {
   if (!snap.exists()) await setDoc(locationDocRef(locationId), emptyData());
 }
 async function saveLocationData(locationId, next) {
-  try { await setDoc(locationDocRef(locationId), next); } catch (e) { console.error("Save failed", e); }
+  // No try/catch here on purpose — a failed write must propagate so the
+  // caller can warn the person and offer a retry, instead of silently
+  // pretending the save worked.
+  await setDoc(locationDocRef(locationId), next);
 }
 async function saveLocationsList(list) {
   try { await setDoc(LOCATIONS_DOC, { list }); } catch (e) { console.error("Save failed", e); }
@@ -2708,6 +2711,9 @@ export default function App() {
   const [view, setView] = useState("dashboard");
   const [printJob, setPrintJob] = usePrint();
   const showExitWarning = useExitConfirm();
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | error
+  const lastFailedSaveRef = useRef(null);
+  const savedIndicatorTimerRef = useRef(null);
 
   // Session-only login: closing the tab/browser signs the person out;
   // reloading the same tab keeps them signed in.
@@ -2771,7 +2777,25 @@ export default function App() {
     return unsub;
   }, [activeLocationId]);
 
-  const save = (next) => { if (activeLocationId) saveLocationData(activeLocationId, next); };
+  const save = (next) => {
+    if (!activeLocationId) return;
+    setSaveStatus("saving");
+    saveLocationData(activeLocationId, next)
+      .then(() => {
+        lastFailedSaveRef.current = null;
+        setSaveStatus("saved");
+        clearTimeout(savedIndicatorTimerRef.current);
+        savedIndicatorTimerRef.current = setTimeout(() => setSaveStatus("idle"), 2000);
+      })
+      .catch((err) => {
+        console.error("Save failed", err);
+        lastFailedSaveRef.current = next;
+        setSaveStatus("error");
+      });
+  };
+  const retryFailedSave = () => {
+    if (lastFailedSaveRef.current) save(lastFailedSaveRef.current);
+  };
 
   const handleCreateAdmin = async ({ name, username, password }) => {
     setAuthBusy(true);
@@ -2830,6 +2854,19 @@ export default function App() {
           #print-doc { position: absolute; top: 0; left: 0; width: 100%; }
         }
       `}</style>
+
+      {saveStatus === "error" && (
+        <div className="fixed top-0 left-0 right-0 z-[110] bg-red-600 text-white text-sm px-4 py-2.5 flex items-center justify-center gap-3 flex-wrap print:hidden">
+          <AlertTriangle size={15} className="flex-shrink-0" />
+          <span>Your last change couldn't be saved — check your internet connection.</span>
+          <button onClick={retryFailedSave} className="underline font-semibold flex-shrink-0">Retry now</button>
+        </div>
+      )}
+      {saveStatus === "saving" && (
+        <div className="fixed top-0 left-0 right-0 z-[110] bg-[#2B4C7E] text-white text-xs px-4 py-1.5 flex items-center justify-center gap-2 print:hidden">
+          <Loader2 size={12} className="animate-spin" /> Saving…
+        </div>
+      )}
 
       <aside className="w-56 bg-[#1F2428] text-white flex-shrink-0 hidden md:flex flex-col print:hidden">
         <div className="px-5 py-5 border-b border-white/10">
