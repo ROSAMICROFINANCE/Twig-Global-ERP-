@@ -1153,22 +1153,33 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
   const setItems = (v) => setForm({ ...form, items: v });
   const hasDraft = customer.trim() !== "" || items.length > 0;
   const [filterDate, setFilterDate] = useState(todayISO());
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [converting, setConverting] = useState(false);
   const openNew = () => { setCurrent(null); setMode("form"); };
   const cancelForm = () => { discardDraft(); setMode("list"); };
   const openView = (q) => { setCurrent(q); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
     const number = nextNumber("QUO", data.counters.quote);
     const quote = { id: uid(), number, customer, date: todayISO(), items, total, status: "draft", createdBy: user.username };
     const next = { ...data, quotes: [quote, ...data.quotes], counters: { ...data.counters, quote: data.counters.quote + 1 } };
-    setData(next); save(next);
-    clearDraft(); setForm(blankForm);
-    setMode("list");
+    setSaving(true); setSaveError(false);
+    try {
+      await save(next);
+      setData(next);
+      clearDraft(); setForm(blankForm);
+      setMode("list");
+    } catch (err) {
+      setSaveError(true);
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const convertToSalesOrder = (quote) => {
+  const convertToSalesOrder = async (quote) => {
     const insufficient = quote.items.filter((l) => {
       const p = data.products.find((p) => p.id === l.productId);
       return p && l.qty > p.stock;
@@ -1192,8 +1203,16 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
     });
     const quotes = data.quotes.map((q) => (q.id === quote.id ? { ...q, status: "converted" } : q));
     const next = { ...data, products, quotes, salesOrders: [salesOrder, ...data.salesOrders], counters: { ...data.counters, sales: data.counters.sales + 1 } };
-    setData(next); save(next);
-    setMode("list");
+    setConverting(true);
+    try {
+      await save(next);
+      setData(next);
+      setMode("list");
+    } catch (err) {
+      alert("Couldn't reach the cloud storage — the conversion wasn't saved. Nothing has changed; try again once your connection is back.");
+    } finally {
+      setConverting(false);
+    }
   };
 
   if (mode === "form") {
@@ -1206,10 +1225,21 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
         <form onSubmit={submit} className="space-y-4 max-w-3xl">
           <Field label="Customer name"><input required className={inputCls} value={customer} onChange={(e) => setCustomer(e.target.value)} /></Field>
           <LineItemsEditor items={items} setItems={setItems} products={data.products} priceField="sellPrice" />
-          <p className="text-xs text-slate-400">Quotations can list more than what's currently in stock — the stock check only applies once you convert this to a sales order. Your progress here is saved automatically in case the connection drops or the app closes.</p>
+          {saveError && (
+            <div className="flex items-center justify-between gap-2 bg-red-50 border border-red-300 rounded-md px-3 py-2 text-sm text-red-700">
+              <span>Couldn't reach the cloud storage — nothing was saved. Your entry is still here, safe to retry.</span>
+              <button type="submit" className="text-xs underline font-semibold flex-shrink-0">Retry</button>
+            </div>
+          )}
+          <p className="text-xs text-slate-400">Quotations can list more than what's currently in stock — the stock check only applies once you convert this to a sales order. Nothing is confirmed done until it's actually stored in the cloud — if your connection drops, your entry stays right here so you can retry.</p>
           <div className="flex justify-between items-center">
             <div className="text-lg font-semibold">Total: {money(total)}</div>
-            <div className="flex gap-2"><Btn variant="ghost" onClick={cancelForm}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save quotation</Btn></div>
+            <div className="flex gap-2">
+              <Btn variant="ghost" onClick={cancelForm} disabled={saving}>Cancel</Btn>
+              <Btn type="submit" disabled={saving}>
+                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><Check size={14} /> Save quotation</>}
+              </Btn>
+            </div>
           </div>
         </form>
       </div>
@@ -1243,7 +1273,11 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
                 title: "QUOTATION", number: current.number, date: current.date, partyLabel: "Customer",
                 partyName: current.customer, items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total
               }})}><Printer size={14} /> Print</Btn>
-              {current.status !== "converted" && <Btn onClick={() => convertToSalesOrder(current)}><ArrowRight size={14} /> Convert to sales order</Btn>}
+              {current.status !== "converted" && (
+                <Btn onClick={() => convertToSalesOrder(current)} disabled={converting}>
+                  {converting ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><ArrowRight size={14} /> Convert to sales order</>}
+                </Btn>
+              )}
             </div>
           </div>
         </div>
@@ -1276,12 +1310,14 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
   const setPaymentType = (v) => setForm({ ...form, paymentType: v });
   const hasDraft = customer.trim() !== "" || items.length > 0;
   const [filterDate, setFilterDate] = useState(todayISO());
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
   const openNew = () => { setMode("form"); };
   const cancelForm = () => { discardDraft(); setMode("list"); };
   const openView = (d) => { setCurrent(d); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
     const insufficient = items.filter((l) => {
       const p = data.products.find((p) => p.id === l.productId);
@@ -1302,9 +1338,17 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     };
     const products = data.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: p.stock - l.qty } : p; });
     const next = { ...data, products, salesOrders: [salesOrder, ...data.salesOrders], counters: { ...data.counters, sales: data.counters.sales + 1 } };
-    setData(next); save(next);
-    clearDraft(); setForm(blankForm);
-    setMode("list");
+    setSaving(true); setSaveError(false);
+    try {
+      await save(next);
+      setData(next);
+      clearDraft(); setForm(blankForm);
+      setMode("list");
+    } catch (err) {
+      setSaveError(true);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const markPaid = (order) => {
@@ -1334,11 +1378,22 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
             </div>
           </Field>
           <LineItemsEditor items={items} setItems={setItems} products={data.products} priceField="sellPrice" />
+          {saveError && (
+            <div className="flex items-center justify-between gap-2 bg-red-50 border border-red-300 rounded-md px-3 py-2 text-sm text-red-700">
+              <span>Couldn't reach the cloud storage — nothing was saved. Your entry is still here, safe to retry.</span>
+              <button type="submit" className="text-xs underline font-semibold flex-shrink-0">Retry</button>
+            </div>
+          )}
           <div className="flex justify-between items-center">
             <div className="text-lg font-semibold">Total: {money(total)}</div>
-            <div className="flex gap-2"><Btn variant="ghost" onClick={cancelForm}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save — deducts stock</Btn></div>
+            <div className="flex gap-2">
+              <Btn variant="ghost" onClick={cancelForm} disabled={saving}>Cancel</Btn>
+              <Btn type="submit" disabled={saving}>
+                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><Check size={14} /> Save — deducts stock</>}
+              </Btn>
+            </div>
           </div>
-          <p className="text-xs text-slate-400">A sales order can't be saved for more than what's currently in stock. Credit sales appear in the Creditors Report until marked paid. Your progress here is saved automatically in case the connection drops or the app closes.</p>
+          <p className="text-xs text-slate-400">A sales order can't be saved for more than what's currently in stock. Credit sales appear in the Creditors Report until marked paid. Nothing is confirmed done until it's actually stored in the cloud — if your connection drops, your entry stays right here so you can retry.</p>
         </form>
       </div>
     );
@@ -1457,30 +1512,49 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
   const setSupplier = (v) => setForm({ ...form, supplier: v });
   const setItems = (v) => setForm({ ...form, items: v });
   const hasDraft = supplier.trim() !== "" || items.length > 0;
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [receiving, setReceiving] = useState(false);
   const openNew = () => { setMode("form"); };
   const cancelForm = () => { discardDraft(); setMode("list"); };
   const openView = (d) => { setCurrent(d); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
     const number = nextNumber("PO", data.counters.purchase);
     const po = { id: uid(), number, supplier, date: todayISO(), items, total, status: "pending", createdBy: user.username };
     const next = { ...data, purchaseOrders: [po, ...data.purchaseOrders], counters: { ...data.counters, purchase: data.counters.purchase + 1 } };
-    setData(next); save(next);
-    clearDraft(); setForm(blankForm);
-    setMode("list");
+    setSaving(true); setSaveError(false);
+    try {
+      await save(next);
+      setData(next);
+      clearDraft(); setForm(blankForm);
+      setMode("list");
+    } catch (err) {
+      setSaveError(true);
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const markReceived = (po) => {
+  const markReceived = async (po) => {
     const products = data.products.map((p) => {
       const l = po.items.find((l) => l.productId === p.id);
       return l ? { ...p, stock: p.stock + l.qty, lastRestocked: todayISO(), costPrice: l.price || p.costPrice } : p;
     });
     const purchaseOrders = data.purchaseOrders.map((p) => (p.id === po.id ? { ...p, status: "received", receivedDate: todayISO() } : p));
     const next = { ...data, products, purchaseOrders };
-    setData(next); save(next);
-    setCurrent({ ...po, status: "received" });
+    setReceiving(true);
+    try {
+      await save(next);
+      setData(next);
+      setCurrent({ ...po, status: "received" });
+    } catch (err) {
+      alert("Couldn't reach the cloud storage — marking this received wasn't saved. Stock hasn't changed; try again once your connection is back.");
+    } finally {
+      setReceiving(false);
+    }
   };
 
   if (mode === "form") {
@@ -1493,10 +1567,21 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
         <form onSubmit={submit} className="space-y-4 max-w-3xl">
           <Field label="Supplier name"><input required className={inputCls} value={supplier} onChange={(e) => setSupplier(e.target.value)} /></Field>
           <LineItemsEditor items={items} setItems={setItems} products={data.products} priceField="costPrice" showCost />
-          <p className="text-xs text-slate-400">Your progress here is saved automatically in case the connection drops or the app closes.</p>
+          {saveError && (
+            <div className="flex items-center justify-between gap-2 bg-red-50 border border-red-300 rounded-md px-3 py-2 text-sm text-red-700">
+              <span>Couldn't reach the cloud storage — nothing was saved. Your entry is still here, safe to retry.</span>
+              <button type="submit" className="text-xs underline font-semibold flex-shrink-0">Retry</button>
+            </div>
+          )}
+          <p className="text-xs text-slate-400">Nothing is confirmed done until it's actually stored in the cloud — if your connection drops, your entry stays right here so you can retry.</p>
           <div className="flex justify-between items-center">
             <div className="text-lg font-semibold">Total: {money(total)}</div>
-            <div className="flex gap-2"><Btn variant="ghost" onClick={cancelForm}>Cancel</Btn><Btn type="submit"><Check size={14} /> Save purchase order</Btn></div>
+            <div className="flex gap-2">
+              <Btn variant="ghost" onClick={cancelForm} disabled={saving}>Cancel</Btn>
+              <Btn type="submit" disabled={saving}>
+                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><Check size={14} /> Save purchase order</>}
+              </Btn>
+            </div>
           </div>
         </form>
       </div>
@@ -1530,7 +1615,11 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
                 title: "PURCHASE ORDER", number: current.number, date: current.date, partyLabel: "Supplier",
                 partyName: current.supplier, items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total
               }})}><Printer size={14} /> Print</Btn>
-              {current.status !== "received" && <Btn onClick={() => markReceived(current)}><Check size={14} /> Mark received — adds stock</Btn>}
+              {current.status !== "received" && (
+                <Btn onClick={() => markReceived(current)} disabled={receiving}>
+                  {receiving ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><Check size={14} /> Mark received — adds stock</>}
+                </Btn>
+              )}
             </div>
           </div>
         </div>
@@ -2778,9 +2867,9 @@ export default function App() {
   }, [activeLocationId]);
 
   const save = (next) => {
-    if (!activeLocationId) return;
+    if (!activeLocationId) return Promise.reject(new Error("No active location"));
     setSaveStatus("saving");
-    saveLocationData(activeLocationId, next)
+    return saveLocationData(activeLocationId, next)
       .then(() => {
         lastFailedSaveRef.current = null;
         setSaveStatus("saved");
@@ -2791,6 +2880,7 @@ export default function App() {
         console.error("Save failed", err);
         lastFailedSaveRef.current = next;
         setSaveStatus("error");
+        throw err;
       });
   };
   const retryFailedSave = () => {
