@@ -23,6 +23,7 @@ const money = (n) =>
   "$" + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
+const nowTime = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
 const daysSince = (iso) => {
   if (!iso) return null;
@@ -1196,7 +1197,7 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
       const p = data.products.find((p) => p.id === l.productId);
       return { ...l, cost: p ? p.costPrice : 0 };
     });
-    const salesOrder = { id: uid(), number, customer: quote.customer, date: todayISO(), items: soItems, total: quote.total, quoteId: quote.id, createdBy: user.username, paymentType: "cash", paidStatus: "paid" };
+    const salesOrder = { id: uid(), number, customer: quote.customer, date: todayISO(), time: nowTime(), items: soItems, total: quote.total, quoteId: quote.id, createdBy: user.username, paymentType: "cash", paidStatus: "paid" };
     const products = data.products.map((p) => {
       const l = quote.items.find((l) => l.productId === p.id);
       return l ? { ...p, stock: p.stock - l.qty } : p;
@@ -1312,6 +1313,9 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
   const [filterDate, setFilterDate] = useState(todayISO());
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
+  const [showPaymentForm, setShowPaymentForm] = useState(false);
+  const [paymentAmount, setPaymentAmount] = useState(0);
+  const [payingBusy, setPayingBusy] = useState(false);
   const openNew = () => { setMode("form"); };
   const cancelForm = () => { discardDraft(); setMode("list"); };
   const openView = (d) => { setCurrent(d); setMode("view"); };
@@ -1333,8 +1337,8 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     const number = nextNumber("SO", data.counters.sales);
     const soItems = items.map((l) => { const p = data.products.find((p) => p.id === l.productId); return { ...l, cost: p ? p.costPrice : 0 }; });
     const salesOrder = {
-      id: uid(), number, customer, date: todayISO(), items: soItems, total, createdBy: user.username,
-      paymentType, paidStatus: paymentType === "credit" ? "unpaid" : "paid",
+      id: uid(), number, customer, date: todayISO(), time: nowTime(), items: soItems, total, createdBy: user.username,
+      paymentType, paidStatus: paymentType === "credit" ? "unpaid" : "paid", amountPaid: paymentType === "credit" ? 0 : total,
     };
     const products = data.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: p.stock - l.qty } : p; });
     const next = { ...data, products, salesOrders: [salesOrder, ...data.salesOrders], counters: { ...data.counters, sales: data.counters.sales + 1 } };
@@ -1351,13 +1355,37 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     }
   };
 
-  const markPaid = (order) => {
+  const remainingOn = (order) => Math.max(0, order.total - (order.amountPaid || 0));
+
+  const openPaymentForm = (order) => {
+    setPaymentAmount(remainingOn(order));
+    setShowPaymentForm(true);
+  };
+
+  const recordPayment = async (order, amount) => {
+    amount = Number(amount);
+    const remaining = remainingOn(order);
+    if (!amount || amount <= 0 || amount > remaining) {
+      alert(`Enter an amount between 1 and ${money(remaining)} (what's still outstanding on this order).`);
+      return;
+    }
     const paidDate = todayISO();
-    const salesOrders = data.salesOrders.map((o) => (o.id === order.id ? { ...o, paidStatus: "paid", paidDate } : o));
-    const payment = { id: uid(), number: nextNumber("PAY", data.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount: order.total, recordedBy: user.username };
+    const newAmountPaid = (order.amountPaid || 0) + amount;
+    const newStatus = newAmountPaid >= order.total ? "paid" : "partial";
+    const salesOrders = data.salesOrders.map((o) => (o.id === order.id ? { ...o, amountPaid: newAmountPaid, paidStatus: newStatus, paidDate: newStatus === "paid" ? paidDate : o.paidDate } : o));
+    const payment = { id: uid(), number: nextNumber("PAY", data.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount, recordedBy: user.username };
     const next = { ...data, salesOrders, payments: [payment, ...data.payments], counters: { ...data.counters, pay: data.counters.pay + 1 } };
-    setData(next); save(next);
-    setCurrent({ ...order, paidStatus: "paid", paidDate });
+    setPayingBusy(true);
+    try {
+      await save(next);
+      setData(next);
+      setCurrent({ ...order, amountPaid: newAmountPaid, paidStatus: newStatus });
+      setShowPaymentForm(false);
+    } catch (err) {
+      alert("Couldn't reach the cloud storage — the payment wasn't saved. Nothing has changed; try again once your connection is back.");
+    } finally {
+      setPayingBusy(false);
+    }
   };
 
   if (mode === "form") {
@@ -1407,10 +1435,14 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
         </div>
         <div className="max-w-3xl border border-slate-200 rounded-lg bg-white p-5">
           <div className="flex justify-between mb-4">
-            <div><div className="text-lg font-semibold">{current.customer}</div><div className="text-xs text-slate-400 font-mono">{current.number} · {current.date}{current.createdBy ? ` · by ${current.createdBy}` : ""}</div></div>
+            <div><div className="text-lg font-semibold">{current.customer}</div><div className="text-xs text-slate-400 font-mono">{current.number} · {current.date}{current.time ? ` ${current.time}` : ""}{current.createdBy ? ` · by ${current.createdBy}` : ""}</div></div>
             <div className="flex gap-1.5">
               <Tag tone={current.paymentType === "credit" ? "pending" : "good"}>{current.paymentType === "credit" ? "Credit" : "Cash"}</Tag>
-              {current.paymentType === "credit" && <Tag tone={current.paidStatus === "paid" ? "good" : "danger"}>{current.paidStatus}</Tag>}
+              {current.paymentType === "credit" && (
+                <Tag tone={current.paidStatus === "paid" ? "good" : current.paidStatus === "partial" ? "pending" : "danger"}>
+                  {current.paidStatus === "partial" ? "Partially paid" : current.paidStatus}
+                </Tag>
+              )}
             </div>
           </div>
           <table className="w-full text-sm mb-4">
@@ -1422,6 +1454,9 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
               })}
             </tbody>
           </table>
+          {current.paymentType === "credit" && current.paidStatus !== "paid" && (current.amountPaid || 0) > 0 && (
+            <div className="text-sm text-slate-500 mb-2">Paid so far: <span className="font-mono">{money(current.amountPaid)}</span> · Outstanding: <span className="font-mono text-red-600">{money(remainingOn(current))}</span></div>
+          )}
           <div className="flex justify-between items-center">
             <div className="text-lg font-semibold">Total: {money(current.total)}</div>
             <div className="flex gap-2 flex-wrap justify-end">
@@ -1439,11 +1474,31 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
               </Btn>
               {!isAndroid() && <span className="text-[11px] text-slate-400 self-center">Bluetooth receipt printing works from an Android phone with the Bluetooth Print app installed.</span>}
               {current.paymentType === "credit" && current.paidStatus !== "paid" && (
-                <Btn variant="amber" onClick={() => markPaid(current)}><Check size={14} /> Mark as paid today</Btn>
+                <Btn variant="amber" onClick={() => openPaymentForm(current)}><Check size={14} /> Record payment</Btn>
               )}
             </div>
           </div>
         </div>
+        {showPaymentForm && (
+          <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4" onClick={() => setShowPaymentForm(false)}>
+            <div className="bg-white rounded-lg w-full max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="font-semibold">Record payment — {current.number}</h2>
+                <button onClick={() => setShowPaymentForm(false)}><X size={18} className="text-slate-400" /></button>
+              </div>
+              <p className="text-sm text-slate-500 mb-3">Outstanding: <span className="font-mono text-red-600">{money(remainingOn(current))}</span> of {money(current.total)}. Enter the full amount to settle it, or less for a partial / down payment.</p>
+              <Field label={`Amount received (max ${money(remainingOn(current))})`}>
+                <input type="number" min="1" max={remainingOn(current)} step="0.01" className={inputCls} value={paymentAmount} onChange={(e) => setPaymentAmount(e.target.value)} />
+              </Field>
+              <div className="flex justify-end gap-2 pt-4">
+                <Btn variant="ghost" onClick={() => setShowPaymentForm(false)} disabled={payingBusy}>Cancel</Btn>
+                <Btn onClick={() => recordPayment(current, paymentAmount)} disabled={payingBusy}>
+                  {payingBusy ? <><Loader2 size={14} className="animate-spin" /> Saving…</> : <><Check size={14} /> Save payment</>}
+                </Btn>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -1453,7 +1508,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
       <DateFilterBar date={filterDate} setDate={setFilterDate} />
       <DocList title="Sales Orders" subtitle={`Showing orders for ${formatDateLabel(filterDate)}. Saving one removes stock automatically — can't exceed what's in stock.`}
         docs={data.salesOrders.filter((o) => o.date === filterDate)} columns={["Number", "Date", "Customer", "Total"]} onNew={openNew} onOpen={openView}
-        renderTag={(d) => d.paymentType === "credit" ? <Tag tone={d.paidStatus === "paid" ? "good" : "danger"}>Credit · {d.paidStatus}</Tag> : <Tag tone="good">Cash</Tag>} />
+        renderTag={(d) => d.paymentType === "credit" ? <Tag tone={d.paidStatus === "paid" ? "good" : d.paidStatus === "partial" ? "pending" : "danger"}>Credit · {d.paidStatus === "partial" ? "Partially paid" : d.paidStatus}</Tag> : <Tag tone="good">Cash</Tag>} />
     </div>
   );
 }
@@ -1465,9 +1520,9 @@ function DailyCreditorsReport({ data }) {
   const [filterDate, setFilterDate] = useState(todayISO());
   const rows = useMemo(() => data.salesOrders
     .filter((o) => o.paymentType === "credit" && o.date === filterDate)
-    .map((o) => ({ ...o, days: daysSince(o.date) })), [data.salesOrders, filterDate]);
+    .map((o) => ({ ...o, days: daysSince(o.date), outstanding: Math.max(0, o.total - (o.amountPaid || 0)) })), [data.salesOrders, filterDate]);
   const total = rows.reduce((s, r) => s + r.total, 0);
-  const outstanding = rows.filter((r) => r.paidStatus !== "paid").reduce((s, r) => s + r.total, 0);
+  const outstanding = rows.reduce((s, r) => s + r.outstanding, 0);
 
   return (
     <div>
@@ -1481,7 +1536,7 @@ function DailyCreditorsReport({ data }) {
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
-            <tr><th className="text-left px-3 py-2">Invoice Number</th><th className="text-left px-3 py-2">Customer</th><th className="text-right px-3 py-2">Amount</th><th className="text-left px-3 py-2">Status</th></tr>
+            <tr><th className="text-left px-3 py-2">Invoice Number</th><th className="text-left px-3 py-2">Customer</th><th className="text-right px-3 py-2">Amount</th><th className="text-right px-3 py-2">Outstanding</th><th className="text-left px-3 py-2">Status</th></tr>
           </thead>
           <tbody>
             {rows.map((r) => (
@@ -1489,10 +1544,11 @@ function DailyCreditorsReport({ data }) {
                 <td className="px-3 py-2 font-mono text-xs">{r.number}</td>
                 <td className="px-3 py-2">{r.customer}</td>
                 <td className="px-3 py-2 text-right font-mono">{money(r.total)}</td>
-                <td className="px-3 py-2"><Tag tone={r.paidStatus === "paid" ? "good" : "danger"}>{r.paidStatus}</Tag></td>
+                <td className="px-3 py-2 text-right font-mono text-red-600">{money(r.outstanding)}</td>
+                <td className="px-3 py-2"><Tag tone={r.paidStatus === "paid" ? "good" : r.paidStatus === "partial" ? "pending" : "danger"}>{r.paidStatus === "partial" ? "Partially paid" : r.paidStatus}</Tag></td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={4} className="text-center text-slate-400 py-8 text-sm">No credit sales on this date.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm">No credit sales on this date.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1515,21 +1571,29 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const [receiving, setReceiving] = useState(false);
-  const openNew = () => { setMode("form"); };
-  const cancelForm = () => { discardDraft(); setMode("list"); };
+  const [editingId, setEditingId] = useState(null);
+  const openNew = () => { setEditingId(null); setMode("form"); };
+  const openEdit = (po) => { setEditingId(po.id); setForm({ supplier: po.supplier, items: po.items }); setMode("form"); };
+  const cancelForm = () => { discardDraft(); setEditingId(null); setMode("list"); };
   const openView = (d) => { setCurrent(d); setMode("view"); };
   const total = items.reduce((s, l) => s + l.qty * l.price, 0);
 
   const submit = async (e) => {
     e.preventDefault();
-    const number = nextNumber("PO", data.counters.purchase);
-    const po = { id: uid(), number, supplier, date: todayISO(), items, total, status: "pending", createdBy: user.username };
-    const next = { ...data, purchaseOrders: [po, ...data.purchaseOrders], counters: { ...data.counters, purchase: data.counters.purchase + 1 } };
+    let next;
+    if (editingId) {
+      const purchaseOrders = data.purchaseOrders.map((p) => (p.id === editingId ? { ...p, supplier, items, total } : p));
+      next = { ...data, purchaseOrders };
+    } else {
+      const number = nextNumber("PO", data.counters.purchase);
+      const po = { id: uid(), number, supplier, date: todayISO(), items, total, status: "pending", createdBy: user.username };
+      next = { ...data, purchaseOrders: [po, ...data.purchaseOrders], counters: { ...data.counters, purchase: data.counters.purchase + 1 } };
+    }
     setSaving(true); setSaveError(false);
     try {
       await save(next);
       setData(next);
-      clearDraft(); setForm(blankForm);
+      clearDraft(); setForm(blankForm); setEditingId(null);
       setMode("list");
     } catch (err) {
       setSaveError(true);
@@ -1561,9 +1625,9 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
     return (
       <div>
         <div className="flex items-center gap-2 mb-4 text-sm text-slate-500">
-          <button onClick={cancelForm} className="hover:text-[#2B4C7E]">Purchase orders</button><ChevronRight size={13} /> <span className="text-slate-800">New purchase order</span>
+          <button onClick={cancelForm} className="hover:text-[#2B4C7E]">Purchase orders</button><ChevronRight size={13} /> <span className="text-slate-800">{editingId ? "Edit purchase order" : "New purchase order"}</span>
         </div>
-        {draftRestored && hasDraft && <DraftRestoredNotice onDiscard={discardDraft} />}
+        {!editingId && draftRestored && hasDraft && <DraftRestoredNotice onDiscard={discardDraft} />}
         <form onSubmit={submit} className="space-y-4 max-w-3xl">
           <Field label="Supplier name"><input required className={inputCls} value={supplier} onChange={(e) => setSupplier(e.target.value)} /></Field>
           <LineItemsEditor items={items} setItems={setItems} products={data.products} priceField="costPrice" showCost />
@@ -1579,7 +1643,7 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
             <div className="flex gap-2">
               <Btn variant="ghost" onClick={cancelForm} disabled={saving}>Cancel</Btn>
               <Btn type="submit" disabled={saving}>
-                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><Check size={14} /> Save purchase order</>}
+                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><Check size={14} /> {editingId ? "Save changes" : "Save purchase order"}</>}
               </Btn>
             </div>
           </div>
@@ -1615,6 +1679,9 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
                 title: "PURCHASE ORDER", number: current.number, date: current.date, partyLabel: "Supplier",
                 partyName: current.supplier, items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total
               }})}><Printer size={14} /> Print</Btn>
+              {current.status !== "received" && (
+                <Btn variant="outline" onClick={() => openEdit(current)}>Edit</Btn>
+              )}
               {current.status !== "received" && (
                 <Btn onClick={() => markReceived(current)} disabled={receiving}>
                   {receiving ? <><Loader2 size={14} className="animate-spin" /> Saving to cloud…</> : <><Check size={14} /> Mark received — adds stock</>}
@@ -2331,14 +2398,14 @@ function IncomeStatement({ data }) {
 function CreditorsReport({ data }) {
   const rows = useMemo(() => data.salesOrders
     .filter((o) => o.paymentType === "credit" && o.paidStatus !== "paid")
-    .map((o) => ({ ...o, days: daysSince(o.date) }))
+    .map((o) => ({ ...o, days: daysSince(o.date), outstanding: Math.max(0, o.total - (o.amountPaid || 0)) }))
     .sort((a, b) => b.days - a.days), [data.salesOrders]);
-  const grandTotal = rows.reduce((s, r) => s + r.total, 0);
+  const grandTotal = rows.reduce((s, r) => s + r.outstanding, 0);
 
   return (
     <div>
       <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Creditors Report</h2>
-      <p className="text-sm text-slate-500 mb-4">Every unpaid credit sale, company-wide, by invoice.</p>
+      <p className="text-sm text-slate-500 mb-4">Every unpaid or partially paid credit sale, company-wide, by invoice.</p>
       <div className="border border-slate-200 rounded-lg p-4 bg-white mb-4 inline-block">
         <div className="text-[11px] font-mono uppercase text-slate-400 mb-1">Total outstanding</div>
         <div className="text-xl font-semibold text-red-600">{money(grandTotal)}</div>
@@ -2346,7 +2413,7 @@ function CreditorsReport({ data }) {
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
-            <tr><th className="text-left px-3 py-2">Customer</th><th className="text-left px-3 py-2">Invoice Number</th><th className="text-left px-3 py-2">Date</th><th className="text-right px-3 py-2">Amount</th><th className="text-right px-3 py-2">Days outstanding</th></tr>
+            <tr><th className="text-left px-3 py-2">Customer</th><th className="text-left px-3 py-2">Invoice Number</th><th className="text-left px-3 py-2">Date</th><th className="text-right px-3 py-2">Order Total</th><th className="text-right px-3 py-2">Outstanding</th><th className="text-right px-3 py-2">Days outstanding</th></tr>
           </thead>
           <tbody>
             {rows.map((r) => (
@@ -2354,16 +2421,18 @@ function CreditorsReport({ data }) {
                 <td className="px-3 py-2 font-medium">{r.customer}</td>
                 <td className="px-3 py-2 font-mono text-xs">{r.number}</td>
                 <td className="px-3 py-2">{r.date}</td>
-                <td className="px-3 py-2 text-right font-mono text-red-600">{money(r.total)}</td>
+                <td className="px-3 py-2 text-right font-mono">{money(r.total)}</td>
+                <td className="px-3 py-2 text-right font-mono text-red-600">{money(r.outstanding)}</td>
                 <td className="px-3 py-2 text-right font-mono">{r.days}d</td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm">No outstanding credit — nothing owed.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">No outstanding credit — nothing owed.</td></tr>}
           </tbody>
           {rows.length > 0 && (
             <tfoot>
               <tr className="border-t-2 border-slate-300 bg-slate-50 font-semibold">
                 <td colSpan={3} className="px-3 py-2">Total outstanding</td>
+                <td></td>
                 <td className="px-3 py-2 text-right font-mono text-red-600">{money(grandTotal)}</td>
                 <td></td>
               </tr>
