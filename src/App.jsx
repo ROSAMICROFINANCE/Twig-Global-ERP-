@@ -12,7 +12,7 @@ import {
   signOut, setPersistence, browserSessionPersistence
 } from "firebase/auth";
 import {
-  doc, getDoc, setDoc, onSnapshot, collection, deleteDoc
+  doc, getDoc, setDoc, updateDoc, onSnapshot, collection, deleteDoc, getDocs, query, orderBy, limit
 } from "firebase/firestore";
 import { auth, db, getSecondaryAuth, toAuthEmail } from "./firebase";
 
@@ -131,14 +131,50 @@ async function ensureLocationDoc(locationId) {
   const snap = await getDoc(locationDocRef(locationId));
   if (!snap.exists()) await setDoc(locationDocRef(locationId), emptyData());
 }
-async function saveLocationData(locationId, next) {
+async function saveLocationData(locationId, changes) {
+  // Only ever writes the specific top-level fields passed in `changes` —
+  // never the whole document. This is deliberate: a full-document setDoc
+  // sends this device's entire local copy (products, sales, everything)
+  // on every save, so if that copy was even slightly out of date (another
+  // device had just written something), it would silently overwrite
+  // perfectly good data this device didn't even touch. updateDoc only
+  // changes the named fields, leaving everything else exactly as the
+  // server already has it.
   // No try/catch here on purpose — a failed write must propagate so the
   // caller can warn the person and offer a retry, instead of silently
   // pretending the save worked.
-  await setDoc(locationDocRef(locationId), next);
+  await updateDoc(locationDocRef(locationId), changes);
 }
 async function saveLocationsList(list) {
   try { await setDoc(LOCATIONS_DOC, { list }); } catch (e) { console.error("Save failed", e); }
+}
+
+/* ---------------------------------------------------------
+   Daily backups — a full snapshot of this location's data,
+   written to its own safe corner of the database every day,
+   separate from the live data. If the live data is ever damaged,
+   any recent day's snapshot can be restored from Settings.
+--------------------------------------------------------- */
+const backupsColRef = (locationId) => collection(db, "business", locationId, "backups");
+
+async function createBackupSnapshot(locationId, data) {
+  const dateId = todayISO();
+  const snapshot = { ...data, backedUpAt: new Date().toISOString() };
+  await setDoc(doc(backupsColRef(locationId), dateId), snapshot);
+}
+
+async function listBackups(locationId, max = 30) {
+  const q = query(backupsColRef(locationId), orderBy("backedUpAt", "desc"), limit(max));
+  const snap = await getDocs(q);
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+}
+
+async function restoreFromBackup(locationId, backup) {
+  // A restore is a full replacement of the live document, by design —
+  // unlike normal everyday saves, this one genuinely means "make the live
+  // data exactly match this snapshot," so a full setDoc is correct here.
+  const { id, backedUpAt, ...rest } = backup;
+  await setDoc(locationDocRef(locationId), { ...emptyData(), ...rest });
 }
 
 /* ---------------------------------------------------------
@@ -763,13 +799,14 @@ function StockLevels({ data, setData, save }) {
       counters = { ...data.counters, product: data.counters.product + 1 };
     }
     const next = { ...data, products, counters };
-    setData(next); save(next);
+    setData(next); save({ products, counters });
     setShowForm(false);
   };
 
   const removeProduct = (id) => {
-    const next = { ...data, products: data.products.filter((p) => p.id !== id) };
-    setData(next); save(next);
+    const products = data.products.filter((p) => p.id !== id);
+    const next = { ...data, products };
+    setData(next); save({ products });
   };
 
   const downloadTemplate = () => {
@@ -811,8 +848,10 @@ function StockLevels({ data, setData, save }) {
           createdAt: todayISO(), lastRestocked: todayISO(),
         };
       });
-      const next = { ...data, products: [...data.products, ...imported], counters: { ...data.counters, product: counter } };
-      setData(next); save(next);
+      const products = [...data.products, ...imported];
+      const counters = { ...data.counters, product: counter };
+      const next = { ...data, products, counters };
+      setData(next); save({ products, counters });
     } catch (err) {
       alert("Could not read that file. Use the downloadable template — columns: Name, Category, Cost Price, Sell Price, Current Stock, Minimum Stock.");
     }
@@ -922,8 +961,10 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
       reason: form.reason, processedBy: user.username,
       value: form.type === "damaged" ? qty * product.costPrice : 0,
     };
-    const next = { ...data, products, returns: [entry, ...data.returns], counters: { ...data.counters, ret: data.counters.ret + 1 } };
-    setData(next); save(next);
+    const returns = [entry, ...data.returns];
+    const counters = { ...data.counters, ret: data.counters.ret + 1 };
+    const next = { ...data, products, returns, counters };
+    setData(next); save({ products, returns, counters });
     setForm(blank); setShowForm(false);
   };
 
@@ -1021,8 +1062,10 @@ function RepackRegister({ data, setData, save, user }) {
       targetProductId: target.id, targetName: target.name, targetQty, yieldPerUnit, unitCost,
       createdBy: user.username,
     };
-    const next = { ...data, products, repacks: [entry, ...data.repacks], counters: { ...data.counters, repack: data.counters.repack + 1 } };
-    setData(next); save(next);
+    const repacks = [entry, ...data.repacks];
+    const counters = { ...data.counters, repack: data.counters.repack + 1 };
+    const next = { ...data, products, repacks, counters };
+    setData(next); save({ products, repacks, counters });
     setForm(blank); setShowForm(false);
   };
 
@@ -1166,10 +1209,12 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
     e.preventDefault();
     const number = nextNumber("QUO", data.counters.quote);
     const quote = { id: uid(), number, customer, date: todayISO(), items, total, status: "draft", createdBy: user.username };
-    const next = { ...data, quotes: [quote, ...data.quotes], counters: { ...data.counters, quote: data.counters.quote + 1 } };
+    const quotes = [quote, ...data.quotes];
+    const counters = { ...data.counters, quote: data.counters.quote + 1 };
+    const next = { ...data, quotes, counters };
     setSaving(true); setSaveError(false);
     try {
-      await save(next);
+      await save({ quotes, counters });
       setData(next);
       clearDraft(); setForm(blankForm);
       setMode("list");
@@ -1203,10 +1248,12 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
       return l ? { ...p, stock: p.stock - l.qty } : p;
     });
     const quotes = data.quotes.map((q) => (q.id === quote.id ? { ...q, status: "converted" } : q));
-    const next = { ...data, products, quotes, salesOrders: [salesOrder, ...data.salesOrders], counters: { ...data.counters, sales: data.counters.sales + 1 } };
+    const salesOrders = [salesOrder, ...data.salesOrders];
+    const counters = { ...data.counters, sales: data.counters.sales + 1 };
+    const next = { ...data, products, quotes, salesOrders, counters };
     setConverting(true);
     try {
-      await save(next);
+      await save({ products, quotes, salesOrders, counters });
       setData(next);
       setMode("list");
     } catch (err) {
@@ -1341,10 +1388,12 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
       paymentType, paidStatus: paymentType === "credit" ? "unpaid" : "paid", amountPaid: paymentType === "credit" ? 0 : total,
     };
     const products = data.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: p.stock - l.qty } : p; });
-    const next = { ...data, products, salesOrders: [salesOrder, ...data.salesOrders], counters: { ...data.counters, sales: data.counters.sales + 1 } };
+    const salesOrders = [salesOrder, ...data.salesOrders];
+    const counters = { ...data.counters, sales: data.counters.sales + 1 };
+    const next = { ...data, products, salesOrders, counters };
     setSaving(true); setSaveError(false);
     try {
-      await save(next);
+      await save({ products, salesOrders, counters });
       setData(next);
       clearDraft(); setForm(blankForm);
       setMode("list");
@@ -1374,10 +1423,12 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     const newStatus = newAmountPaid >= order.total ? "paid" : "partial";
     const salesOrders = data.salesOrders.map((o) => (o.id === order.id ? { ...o, amountPaid: newAmountPaid, paidStatus: newStatus, paidDate: newStatus === "paid" ? paidDate : o.paidDate } : o));
     const payment = { id: uid(), number: nextNumber("PAY", data.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount, recordedBy: user.username };
-    const next = { ...data, salesOrders, payments: [payment, ...data.payments], counters: { ...data.counters, pay: data.counters.pay + 1 } };
+    const payments = [payment, ...data.payments];
+    const counters = { ...data.counters, pay: data.counters.pay + 1 };
+    const next = { ...data, salesOrders, payments, counters };
     setPayingBusy(true);
     try {
-      await save(next);
+      await save({ salesOrders, payments, counters });
       setData(next);
       setCurrent({ ...order, amountPaid: newAmountPaid, paidStatus: newStatus });
       setShowPaymentForm(false);
@@ -1580,18 +1631,22 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
 
   const submit = async (e) => {
     e.preventDefault();
-    let next;
+    let changes, next;
     if (editingId) {
       const purchaseOrders = data.purchaseOrders.map((p) => (p.id === editingId ? { ...p, supplier, items, total } : p));
+      changes = { purchaseOrders };
       next = { ...data, purchaseOrders };
     } else {
       const number = nextNumber("PO", data.counters.purchase);
       const po = { id: uid(), number, supplier, date: todayISO(), items, total, status: "pending", createdBy: user.username };
-      next = { ...data, purchaseOrders: [po, ...data.purchaseOrders], counters: { ...data.counters, purchase: data.counters.purchase + 1 } };
+      const purchaseOrders = [po, ...data.purchaseOrders];
+      const counters = { ...data.counters, purchase: data.counters.purchase + 1 };
+      changes = { purchaseOrders, counters };
+      next = { ...data, purchaseOrders, counters };
     }
     setSaving(true); setSaveError(false);
     try {
-      await save(next);
+      await save(changes);
       setData(next);
       clearDraft(); setForm(blankForm); setEditingId(null);
       setMode("list");
@@ -1611,7 +1666,7 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
     const next = { ...data, products, purchaseOrders };
     setReceiving(true);
     try {
-      await save(next);
+      await save({ products, purchaseOrders });
       setData(next);
       setCurrent({ ...po, status: "received" });
     } catch (err) {
@@ -1728,8 +1783,10 @@ function TransferOutRegister({ data, setData, save, user }) {
       valueAtCost: qty * product.costPrice, createdBy: user.username,
     };
     const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock - qty } : p));
-    const next = { ...data, products, transfers: [entry, ...data.transfers], counters: { ...data.counters, transfer: data.counters.transfer + 1 } };
-    setData(next); save(next);
+    const transfers = [entry, ...data.transfers];
+    const counters = { ...data.counters, transfer: data.counters.transfer + 1 };
+    const next = { ...data, products, transfers, counters };
+    setData(next); save({ products, transfers, counters });
     setForm(blank); setShowForm(false);
   };
 
@@ -1824,8 +1881,10 @@ function LoanReturnsRegister({ data, setData, save, user }) {
       party: loan.party, qty, notes: form.notes, valueAtCost: qty * product.costPrice, createdBy: user.username,
     };
     const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
-    const next = { ...data, products, loanReturns: [entry, ...(data.loanReturns || [])], counters: { ...data.counters, loanReturn: data.counters.loanReturn + 1 } };
-    setData(next); save(next);
+    const loanReturns = [entry, ...(data.loanReturns || [])];
+    const counters = { ...data.counters, loanReturn: data.counters.loanReturn + 1 };
+    const next = { ...data, products, loanReturns, counters };
+    setData(next); save({ products, loanReturns, counters });
     setForm(blank); setShowForm(false);
   };
 
@@ -1913,8 +1972,10 @@ function TransferInRegister({ data, setData, save, user }) {
       valueAtCost: qty * product.costPrice, createdBy: user.username,
     };
     const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
-    const next = { ...data, products, transfers: [entry, ...data.transfers], counters: { ...data.counters, transfer: data.counters.transfer + 1 } };
-    setData(next); save(next);
+    const transfers = [entry, ...data.transfers];
+    const counters = { ...data.counters, transfer: data.counters.transfer + 1 };
+    const next = { ...data, products, transfers, counters };
+    setData(next); save({ products, transfers, counters });
     setForm(blank); setShowForm(false);
   };
 
@@ -2092,14 +2153,17 @@ function DailyExpenseRegister({ data, setData, save, user }) {
   const submit = (e) => {
     e.preventDefault();
     const entry = { id: uid(), number: nextNumber("EXP", data.counters.exp), ...form, amount: Number(form.amount), recordedBy: user.username };
-    const next = { ...data, expenses: [entry, ...data.expenses], counters: { ...data.counters, exp: data.counters.exp + 1 } };
-    setData(next); save(next);
+    const expenses = [entry, ...data.expenses];
+    const counters = { ...data.counters, exp: data.counters.exp + 1 };
+    const next = { ...data, expenses, counters };
+    setData(next); save({ expenses, counters });
     setForm(blank); setShowForm(false);
   };
 
   const removeExpense = (id) => {
-    const next = { ...data, expenses: data.expenses.filter((e) => e.id !== id) };
-    setData(next); save(next);
+    const expenses = data.expenses.filter((e) => e.id !== id);
+    const next = { ...data, expenses };
+    setData(next); save({ expenses });
   };
 
   const dayEntries = data.expenses.filter((e) => e.date === filterDate);
@@ -2793,7 +2857,7 @@ function InvoiceLayoutSettings({ data, setData, save, activeLocationName }) {
   const submit = (e) => {
     e.preventDefault();
     const next = { ...data, invoiceSettings: form };
-    setData(next); save(next);
+    setData(next); save({ invoiceSettings: form });
   };
 
   const handleLogoUpload = async (e) => {
@@ -2835,12 +2899,129 @@ function InvoiceLayoutSettings({ data, setData, save, activeLocationName }) {
 /* ---------------------------------------------------------
    Settings hub
 --------------------------------------------------------- */
-function SettingsHub({ users, refreshUsers, locations, refreshLocations, data, setData, save, activeLocationName }) {
+/* ---------------------------------------------------------
+   Settings: Backups — daily snapshots + manual backup-now,
+   with restore and a device-local download for extra safety.
+--------------------------------------------------------- */
+function BackupsSettings({ data, setData, save, activeLocationId, activeLocationName }) {
+  const [backups, setBackups] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState(null);
+  const [backingUpNow, setBackingUpNow] = useState(false);
+
+  const refresh = () => {
+    if (!activeLocationId) return;
+    setLoading(true);
+    listBackups(activeLocationId).then((list) => { setBackups(list); setLoading(false); }).catch(() => setLoading(false));
+  };
+  useEffect(() => { refresh(); }, [activeLocationId]); // eslint-disable-line
+
+  const backupNow = async () => {
+    setBackingUpNow(true);
+    try {
+      await createBackupSnapshot(activeLocationId, data);
+      refresh();
+    } catch (err) {
+      alert("Couldn't reach the cloud storage — the backup wasn't saved. Try again once your connection is back.");
+    } finally {
+      setBackingUpNow(false);
+    }
+  };
+
+  const downloadDeviceCopy = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${(activeLocationName || "shop").replace(/\s+/g, "-").toLowerCase()}-backup-${todayISO()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadBackupProductsExcel = (backup) => {
+    const wb = XLSX.utils.book_new();
+    const rows = [["Name", "Category", "Cost Price", "Sell Price", "Current Stock", "Minimum Stock"]];
+    (backup.products || []).forEach((p) => rows.push([p.name, p.category, p.costPrice, p.sellPrice, p.stock, p.minStock]));
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, "Products");
+    XLSX.writeFile(wb, `products-backup-${backup.id}.xlsx`);
+  };
+
+  const downloadBackupJson = (backup) => {
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `backup-${backup.id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const restore = async (backup) => {
+    if (!confirm(`Restore the ${backup.id} backup? This replaces ALL current data for ${activeLocationName} — products, sales, purchases, everything — with what's in that snapshot. This can't be undone. Continue?`)) return;
+    setBusyId(backup.id);
+    try {
+      await restoreFromBackup(activeLocationId, backup);
+      const { id, backedUpAt, ...rest } = backup;
+      setData({ ...emptyData(), ...rest });
+    } catch (err) {
+      alert("Couldn't reach the cloud storage — the restore didn't complete. Try again once your connection is back.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div>
+      <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Backups — {activeLocationName}</h2>
+      <p className="text-sm text-slate-500 mb-4">A full snapshot is saved automatically once a day. You can also back up on demand, download a copy to this device, or restore an earlier day if something goes wrong.</p>
+      <div className="flex flex-wrap gap-2 mb-5">
+        <Btn onClick={backupNow} disabled={backingUpNow}>
+          {backingUpNow ? <><Loader2 size={14} className="animate-spin" /> Backing up…</> : <><Check size={14} /> Back up now</>}
+        </Btn>
+        <Btn variant="outline" onClick={downloadDeviceCopy}><Download size={14} /> Download a copy to this device</Btn>
+      </div>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="text-left px-3 py-2">Date</th><th className="text-right px-3 py-2">Products</th>
+              <th className="text-right px-3 py-2">Sales Orders</th><th className="text-right px-3 py-2">Purchase Orders</th>
+              <th className="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {backups.map((b) => (
+              <tr key={b.id} className="border-t border-slate-100">
+                <td className="px-3 py-2 font-mono text-xs">{b.id}</td>
+                <td className="px-3 py-2 text-right font-mono">{(b.products || []).length}</td>
+                <td className="px-3 py-2 text-right font-mono">{(b.salesOrders || []).length}</td>
+                <td className="px-3 py-2 text-right font-mono">{(b.purchaseOrders || []).length}</td>
+                <td className="px-3 py-2 text-right whitespace-nowrap">
+                  <button onClick={() => downloadBackupProductsExcel(b)} className="text-slate-400 hover:text-[#2B4C7E] mr-3 text-xs">Products (Excel)</button>
+                  <button onClick={() => downloadBackupJson(b)} className="text-slate-400 hover:text-[#2B4C7E] mr-3 text-xs">Full backup (JSON)</button>
+                  <button onClick={() => restore(b)} disabled={busyId === b.id} className="text-red-500 hover:text-red-700 text-xs font-medium">
+                    {busyId === b.id ? "Restoring…" : "Restore"}
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {!loading && backups.length === 0 && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm">No backups yet — the first automatic one appears a few seconds after you're signed in, or tap "Back up now" above.</td></tr>}
+            {loading && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm"><Loader2 size={16} className="animate-spin inline" /></td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function SettingsHub({ users, refreshUsers, locations, refreshLocations, data, setData, save, activeLocationName, activeLocationId }) {
   const [tab, setTab] = useState("users");
   const tabs = [
     { id: "users", label: "Users & Rights" },
     { id: "locations", label: "Locations" },
     { id: "invoice", label: "Invoice Layout" },
+    { id: "backups", label: "Backups" },
   ];
   return (
     <div>
@@ -2849,6 +3030,7 @@ function SettingsHub({ users, refreshUsers, locations, refreshLocations, data, s
       {tab === "users" && <UsersSettings users={users} refreshUsers={refreshUsers} locations={locations} />}
       {tab === "locations" && <LocationsSettings locations={locations} refreshLocations={refreshLocations} />}
       {tab === "invoice" && <InvoiceLayoutSettings data={data} setData={setData} save={save} activeLocationName={activeLocationName} />}
+      {tab === "backups" && <BackupsSettings data={data} setData={setData} save={save} activeLocationId={activeLocationId} activeLocationName={activeLocationName} />}
     </div>
   );
 }
@@ -2934,6 +3116,31 @@ export default function App() {
     });
     return unsub;
   }, [activeLocationId]);
+
+  // Keep a ref in sync with the latest data so the once-a-day backup
+  // effect below can read it without re-triggering on every data change.
+  const dataRef = useRef(data);
+  useEffect(() => { dataRef.current = data; }, [data]);
+
+  // Automatic daily backup — once per day per location, this device
+  // quietly saves a full snapshot of the live data into its own safe
+  // corner of the database (Settings → Backups can restore from it).
+  useEffect(() => {
+    if (!activeLocationId) return;
+    const storageKey = `twigerp-lastbackup:${activeLocationId}`;
+    const today = todayISO();
+    let lastBackup = null;
+    try { lastBackup = window.localStorage.getItem(storageKey); } catch (e) {}
+    if (lastBackup === today) return;
+    const t = setTimeout(() => {
+      const current = dataRef.current;
+      if (!current || current.products.length === 0) return; // nothing worth backing up yet
+      createBackupSnapshot(activeLocationId, current)
+        .then(() => { try { window.localStorage.setItem(storageKey, today); } catch (e) {} })
+        .catch((err) => console.error("Daily backup failed", err));
+    }, 5000);
+    return () => clearTimeout(t);
+  }, [activeLocationId]); // eslint-disable-line
 
   const save = (next) => {
     if (!activeLocationId) return Promise.reject(new Error("No active location"));
@@ -3091,7 +3298,7 @@ export default function App() {
         {activeView === "accounting" && <AccountingHub data={data} user={currentUser} />}
         {activeView === "settings" && currentUser.isAdmin && (
           <SettingsHub users={users} refreshUsers={() => {}} locations={locations} refreshLocations={() => {}}
-            data={data} setData={setData} save={save} activeLocationName={activeLocation ? activeLocation.name : ""} />
+            data={data} setData={setData} save={save} activeLocationName={activeLocation ? activeLocation.name : ""} activeLocationId={activeLocationId} />
         )}
       </main>
 
