@@ -74,8 +74,10 @@ const REGISTERS = {
   ],
   stock: [
     { id: "levels", label: "Stock Levels" },
+    { id: "lowStock", label: "Low Stock Report" },
     { id: "repack", label: "Repackaging" },
     { id: "returns", label: "Goods Returns" },
+    { id: "stocktake", label: "Stocktake" },
   ],
   accounting: [
     { id: "costing", label: "Costing" },
@@ -86,7 +88,7 @@ const REGISTERS = {
 };
 
 const emptyData = () => ({
-  products: [], quotes: [], salesOrders: [], purchaseOrders: [], transfers: [], expenses: [], returns: [], payments: [], repacks: [], loanReturns: [],
+  products: [], quotes: [], salesOrders: [], purchaseOrders: [], transfers: [], expenses: [], returns: [], payments: [], repacks: [], loanReturns: [], stocktakes: [],
   counters: { quote: 1, sales: 1, purchase: 1, transfer: 1, exp: 1, ret: 1, product: 1, pay: 1, repack: 1, loanReturn: 1 },
   invoiceSettings: { shopName: "", tagline: "", phone: "", footerNote: "", logoDataUrl: "" },
 });
@@ -1131,6 +1133,279 @@ function RepackRegister({ data, setData, save, user }) {
   );
 }
 
+/* ---------------------------------------------------------
+   Low Stock Report — every product at or below minimum,
+   worst shortfall first, with an Excel export.
+--------------------------------------------------------- */
+function LowStockReport({ data }) {
+  const lowStock = useMemo(
+    () => data.products
+      .filter((p) => p.stock <= p.minStock)
+      .sort((a, b) => (a.stock - a.minStock) - (b.stock - b.minStock)),
+    [data.products]
+  );
+
+  const downloadExcel = () => {
+    const wb = XLSX.utils.book_new();
+    const rows = [["Code", "Product", "Category", "Current Stock", "Minimum", "Shortfall", "Cost Price"]];
+    lowStock.forEach((p) => rows.push([p.sku, p.name, p.category, p.stock, p.minStock, p.minStock - p.stock, p.costPrice]));
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, "Low Stock");
+    XLSX.writeFile(wb, `low-stock-${todayISO()}.xlsx`);
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-lg font-semibold text-[#1F2428]">Low Stock Report</h2>
+        {lowStock.length > 0 && <Btn variant="outline" onClick={downloadExcel}><Download size={14} /> Download Excel</Btn>}
+      </div>
+      <p className="text-sm text-slate-500 mb-4">Every product at or below its minimum stock level, worst shortfall first.</p>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="text-left px-3 py-2">Product</th><th className="text-left px-3 py-2">Code</th>
+              <th className="text-right px-3 py-2">Stock</th><th className="text-right px-3 py-2">Min</th>
+              <th className="text-right px-3 py-2">Short by</th><th className="text-right px-3 py-2">Age</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lowStock.map((p) => {
+              const age = daysSince(p.lastRestocked);
+              return (
+                <tr key={p.id} className="border-t border-slate-100 hover:bg-slate-50">
+                  <td className="px-3 py-2"><div className="font-medium">{p.name}</div><div className="text-[11px] text-slate-400">{p.category}</div></td>
+                  <td className="px-3 py-2 font-mono text-xs text-slate-500">{p.sku}</td>
+                  <td className="px-3 py-2 text-right font-mono">{p.stock}</td>
+                  <td className="px-3 py-2 text-right font-mono text-slate-400">{p.minStock}</td>
+                  <td className="px-3 py-2 text-right font-mono text-red-600">{p.minStock - p.stock}</td>
+                  <td className="px-3 py-2 text-right font-mono text-slate-400">{age !== null ? `${age}d` : "—"}</td>
+                </tr>
+              );
+            })}
+            {lowStock.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">Nothing below minimum right now.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   Stocktake — download a sheet with system quantities,
+   re-import the counted sheet, and reconcile variances
+   before anything is applied to live stock.
+--------------------------------------------------------- */
+function StocktakeRegister({ data, setData, save }) {
+  const fileRef = useRef(null);
+  const [importing, setImporting] = useState(false);
+  const [recon, setRecon] = useState(null);
+  const [unmatched, setUnmatched] = useState([]);
+  const [showOnlyVariances, setShowOnlyVariances] = useState(true);
+  const [applying, setApplying] = useState(false);
+  const [sheetDate, setSheetDate] = useState("");
+
+  const downloadTemplate = () => {
+    const wb = XLSX.utils.book_new();
+    const rows = [["SKU", "Name", "Category", "System Stock", "Counted Stock", "Cost Price", "Sell Price", "Minimum Stock"]];
+    data.products.forEach((p) => rows.push([p.sku, p.name, p.category, p.stock, "", p.costPrice, p.sellPrice, p.minStock]));
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, "Stocktake");
+    XLSX.writeFile(wb, `stocktake-${todayISO()}.xlsx`);
+  };
+
+  const norm = (obj, keys) => {
+    for (const k of Object.keys(obj)) {
+      const lk = k.toLowerCase().trim();
+      for (const target of keys) {
+        if (lk === target || lk.replace(/[\s_]/g, "") === target.replace(/[\s_]/g, "")) return obj[k];
+      }
+    }
+    return undefined;
+  };
+
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImporting(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+      const bySku = new Map(data.products.filter((p) => p.sku).map((p) => [String(p.sku).trim().toLowerCase(), p]));
+      const byName = new Map(data.products.map((p) => [String(p.name).trim().toLowerCase(), p]));
+      const matchedIds = new Set();
+      const results = [];
+      const leftovers = [];
+
+      rows.forEach((r) => {
+        const sku = norm(r, ["sku", "code", "productcode"]);
+        const name = norm(r, ["name", "product", "productname"]);
+        const countedRaw = norm(r, ["countedstock", "counted", "actualstock", "actual"]);
+        if (countedRaw === undefined || countedRaw === "") return;
+        const countedNum = Number(countedRaw);
+        if (Number.isNaN(countedNum)) return;
+
+        let product = sku ? bySku.get(String(sku).trim().toLowerCase()) : undefined;
+        if (!product && name) product = byName.get(String(name).trim().toLowerCase());
+
+        if (!product) {
+          leftovers.push({ sku: sku || "—", name: name || "Unrecognised row", counted: countedNum });
+          return;
+        }
+        matchedIds.add(product.id);
+        const variance = countedNum - product.stock;
+        results.push({
+          id: product.id, sku: product.sku, name: product.name,
+          systemStock: product.stock, countedStock: countedNum,
+          variance, valueDiff: variance * (product.costPrice || 0),
+        });
+      });
+
+      const notCounted = data.products.filter((p) => !matchedIds.has(p.id)).map((p) => ({
+        id: p.id, sku: p.sku, name: p.name, systemStock: p.stock, countedStock: null, variance: null, valueDiff: null,
+      }));
+
+      results.sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance));
+      setRecon([...results, ...notCounted]);
+      setUnmatched(leftovers);
+      setSheetDate(todayISO());
+    } catch (err) {
+      alert("Couldn't read that file. Use the downloaded stocktake sheet and fill in the Counted Stock column.");
+    }
+    setImporting(false);
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  const countedRows = (recon || []).filter((r) => r.countedStock !== null);
+  const variances = countedRows.filter((r) => r.variance !== 0);
+  const totalValueImpact = countedRows.reduce((s, r) => s + (r.valueDiff || 0), 0);
+  const notCountedList = (recon || []).filter((r) => r.countedStock === null);
+  const rowsToShow = recon ? (showOnlyVariances ? [...variances, ...notCountedList] : recon) : [];
+
+  const applyCounts = async () => {
+    if (!confirm(`Apply ${variances.length} counted change(s) to live stock? This updates Current Stock to match what you counted. This can't be undone.`)) return;
+    setApplying(true);
+    try {
+      const updates = new Map(countedRows.map((r) => [r.id, r.countedStock]));
+      const products = data.products.map((p) => (updates.has(p.id) ? { ...p, stock: updates.get(p.id) } : p));
+      const stocktakeRecord = {
+        id: uid(), date: sheetDate || todayISO(), time: nowTime(),
+        itemsCounted: countedRows.length, itemsVaried: variances.length, valueImpact: totalValueImpact,
+      };
+      const stocktakes = [stocktakeRecord, ...(data.stocktakes || [])].slice(0, 50);
+      setData({ ...data, products, stocktakes });
+      await save({ products, stocktakes });
+      setRecon(null);
+      setUnmatched([]);
+    } catch (err) {
+      alert("Couldn't reach the cloud storage — the update wasn't saved. Try again once your connection is back.");
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  return (
+    <div>
+      <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Stocktake</h2>
+      <p className="text-sm text-slate-500 mb-4">
+        Download a sheet with every product and its current system stock, fill in what you actually counted in the Counted Stock column, then upload it back here — you'll see every variance before anything changes.
+      </p>
+      <div className="flex flex-wrap items-center gap-2 mb-5">
+        <Btn variant="outline" onClick={downloadTemplate}><Download size={14} /> Download stocktake sheet</Btn>
+        <input type="file" accept=".xlsx,.xls,.csv" ref={fileRef} className="hidden" onChange={handleUpload} />
+        <Btn variant="outline" onClick={() => fileRef.current.click()} disabled={importing}>
+          {importing ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />} Upload counted sheet
+        </Btn>
+      </div>
+
+      {recon && (
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+            <div className="flex flex-wrap gap-4 text-sm">
+              <div><span className="text-slate-400">Counted:</span> <span className="font-mono">{countedRows.length}</span> of {data.products.length}</div>
+              <div><span className="text-slate-400">Variances:</span> <span className="font-mono text-red-600">{variances.length}</span></div>
+              <div><span className="text-slate-400">Value impact:</span> <span className={"font-mono " + (totalValueImpact < 0 ? "text-red-600" : totalValueImpact > 0 ? "text-emerald-600" : "")}>{money(totalValueImpact)}</span></div>
+            </div>
+            <label className="flex items-center gap-1.5 text-xs text-slate-500">
+              <input type="checkbox" checked={showOnlyVariances} onChange={(e) => setShowOnlyVariances(e.target.checked)} />
+              Show only variances / not counted
+            </label>
+          </div>
+
+          <div className="border border-slate-200 rounded-lg overflow-hidden bg-white mb-4">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="text-left px-3 py-2">Product</th><th className="text-left px-3 py-2">Code</th>
+                  <th className="text-right px-3 py-2">System</th><th className="text-right px-3 py-2">Counted</th>
+                  <th className="text-right px-3 py-2">Variance</th><th className="text-right px-3 py-2">Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rowsToShow.map((r) => (
+                  <tr key={r.id} className="border-t border-slate-100">
+                    <td className="px-3 py-2">{r.name}</td>
+                    <td className="px-3 py-2 font-mono text-xs text-slate-500">{r.sku}</td>
+                    <td className="px-3 py-2 text-right font-mono">{r.systemStock}</td>
+                    <td className="px-3 py-2 text-right font-mono">{r.countedStock === null ? <span className="text-slate-400">Not counted</span> : r.countedStock}</td>
+                    <td className={"px-3 py-2 text-right font-mono " + (r.variance > 0 ? "text-emerald-600" : r.variance < 0 ? "text-red-600" : "text-slate-400")}>
+                      {r.variance === null ? "—" : (r.variance > 0 ? "+" : "") + r.variance}
+                    </td>
+                    <td className={"px-3 py-2 text-right font-mono " + (r.valueDiff > 0 ? "text-emerald-600" : r.valueDiff < 0 ? "text-red-600" : "text-slate-400")}>
+                      {r.valueDiff === null ? "—" : money(r.valueDiff)}
+                    </td>
+                  </tr>
+                ))}
+                {rowsToShow.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">No variances — everything counted matches the system.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+
+          {unmatched.length > 0 && (
+            <div className="text-xs text-amber-600 mb-4">
+              {unmatched.length} row(s) in the file didn't match any product by SKU or name and were skipped — double-check those product codes.
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <Btn onClick={applyCounts} disabled={applying || variances.length === 0}>
+              {applying ? <><Loader2 size={14} className="animate-spin" /> Applying…</> : <><Check size={14} /> Apply counts to stock</>}
+            </Btn>
+            <Btn variant="ghost" onClick={() => { setRecon(null); setUnmatched([]); }}>Discard</Btn>
+          </div>
+        </>
+      )}
+
+      {!recon && (data.stocktakes || []).length > 0 && (
+        <div className="mt-6">
+          <h3 className="text-sm font-semibold text-slate-600 mb-2">Recent stocktakes</h3>
+          <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+                <tr><th className="text-left px-3 py-2">Date</th><th className="text-right px-3 py-2">Counted</th><th className="text-right px-3 py-2">Varied</th><th className="text-right px-3 py-2">Value Impact</th></tr>
+              </thead>
+              <tbody>
+                {data.stocktakes.slice(0, 10).map((s) => (
+                  <tr key={s.id} className="border-t border-slate-100">
+                    <td className="px-3 py-2 font-mono text-xs">{s.date} {s.time}</td>
+                    <td className="px-3 py-2 text-right font-mono">{s.itemsCounted}</td>
+                    <td className="px-3 py-2 text-right font-mono">{s.itemsVaried}</td>
+                    <td className={"px-3 py-2 text-right font-mono " + (s.valueImpact < 0 ? "text-red-600" : s.valueImpact > 0 ? "text-emerald-600" : "")}>{money(s.valueImpact)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StockHub({ data, setData, save, user }) {
   const allowedTabs = REGISTERS.stock.filter((t) => canAccessRegister(user, "stock", t.id));
   const [tab, setTab] = useState(allowedTabs[0] ? allowedTabs[0].id : "levels");
@@ -1142,8 +1417,10 @@ function StockHub({ data, setData, save, user }) {
         <>
           <TabBar tabs={allowedTabs} active={tab} onChange={setTab} />
           {tab === "levels" && <StockLevels data={data} setData={setData} save={save} />}
+          {tab === "lowStock" && <LowStockReport data={data} />}
           {tab === "repack" && <RepackRegister data={data} setData={setData} save={save} user={user} />}
           {tab === "returns" && <GoodsReturnsRegister data={data} setData={setData} save={save} user={user} />}
+          {tab === "stocktake" && <StocktakeRegister data={data} setData={setData} save={save} />}
         </>
       )}
     </div>
