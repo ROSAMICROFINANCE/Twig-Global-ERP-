@@ -114,6 +114,11 @@ const canAccessRegister = (user, moduleId, registerId) => {
   return !!regPerms[registerId];
 };
 
+// Editing/deleting products in Stock Levels (and Import Excel) is gated
+// separately from merely viewing Stock — only admins, or a user an admin
+// has explicitly granted stockEditRights to, can change the product list.
+const canEditStock = (user) => !!user && (user.isAdmin || !!user.stockEditRights);
+
 const accessibleLocations = (user, locations) => {
   if (!user) return [];
   if (user.isAdmin) return locations;
@@ -555,7 +560,26 @@ function printViaBluetoothPrintApp(payload) {
   window.location.href = intentUrl;
 }
 
+/* Second printing path — doesn't pin a specific app. Prefers the
+   Web Share sheet (Android Chrome shows every installed app that
+   accepts shared text, thermal-printer apps included) and falls
+   back to a package-less Android share Intent for browsers without
+   the Share API. This is for anyone not using the "Bluetooth Print"
+   app above — RawBT, PrintHand, or any other Bluetooth printer app. */
+function printViaBluetoothChooser(payload) {
+  const text = buildBluetoothPrintText(payload);
+  if (typeof navigator !== "undefined" && navigator.share) {
+    navigator.share({ text }).catch(() => {});
+    return;
+  }
+  const encoded = encodeURIComponent(text);
+  const fallback = encodeURIComponent(window.location.href);
+  const intentUrl = `intent://send#Intent;action=android.intent.action.SEND;type=text/plain;S.android.intent.extra.TEXT=${encoded};S.browser_fallback_url=${fallback};end`;
+  window.location.href = intentUrl;
+}
+
 const isAndroid = () => typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+const canChooserPrint = () => isAndroid() || (typeof navigator !== "undefined" && !!navigator.share);
 
 function usePrint() {
   const [printJob, setPrintJob] = useState(null);
@@ -779,7 +803,8 @@ function Dashboard({ data, setView, user }) {
 /* ---------------------------------------------------------
    Stock module: Stock Levels + Goods Returns
 --------------------------------------------------------- */
-function StockLevels({ data, setData, save }) {
+function StockLevels({ data, setData, save, user }) {
+  const canEdit = canEditStock(user);
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState(null);
   const [search, setSearch] = useState("");
@@ -793,6 +818,7 @@ function StockLevels({ data, setData, save }) {
 
   const submit = (e) => {
     e.preventDefault();
+    if (!canEdit) return;
     let products, counters = data.counters;
     if (editing) {
       products = data.products.map((p) => (p.id === editing ? { ...p, ...form, sku: p.sku, unit: "pc" } : p));
@@ -807,6 +833,7 @@ function StockLevels({ data, setData, save }) {
   };
 
   const removeProduct = (id) => {
+    if (!canEdit) return;
     const products = data.products.filter((p) => p.id !== id);
     const next = { ...data, products };
     setData(next); save({ products });
@@ -821,7 +848,7 @@ function StockLevels({ data, setData, save }) {
 
   const handleImport = async (e) => {
     const file = e.target.files[0];
-    if (!file) return;
+    if (!file || !canEdit) return;
     setImporting(true);
     try {
       const buf = await file.arrayBuffer();
@@ -873,12 +900,15 @@ function StockLevels({ data, setData, save }) {
           <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
           <input className={inputCls + " pl-8"} placeholder="Search products…" value={search} onChange={(e) => setSearch(e.target.value)} />
         </div>
-        <input type="file" accept=".xlsx,.xls,.csv" ref={fileRef} className="hidden" onChange={handleImport} />
-        <Btn variant="outline" onClick={downloadTemplate}><Download size={14} /> Download template</Btn>
-        <Btn variant="outline" onClick={() => fileRef.current.click()} disabled={importing}>
-          {importing ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />} Import Excel
-        </Btn>
-        <Btn onClick={openNew}><Plus size={14} /> Add product</Btn>
+        {canEdit && <>
+          <input type="file" accept=".xlsx,.xls,.csv" ref={fileRef} className="hidden" onChange={handleImport} />
+          <Btn variant="outline" onClick={downloadTemplate}><Download size={14} /> Download template</Btn>
+          <Btn variant="outline" onClick={() => fileRef.current.click()} disabled={importing}>
+            {importing ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />} Import Excel
+          </Btn>
+          <Btn onClick={openNew}><Plus size={14} /> Add product</Btn>
+        </>}
+        {!canEdit && <span className="text-xs text-slate-400 self-center">View only — ask an admin for edit access to add, edit, delete, or import products.</span>}
       </div>
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
@@ -905,8 +935,10 @@ function StockLevels({ data, setData, save }) {
                   <td className="px-3 py-2 text-right font-mono">{money(p.sellPrice)}</td>
                   <td className="px-3 py-2">{low && <Tag tone="low"><AlertTriangle size={11} /> Reorder</Tag>}</td>
                   <td className="px-3 py-2 text-right whitespace-nowrap">
-                    <button onClick={() => openEdit(p)} className="text-slate-400 hover:text-[#2B4C7E] mr-2 text-xs">Edit</button>
-                    <button onClick={() => removeProduct(p.id)} className="text-slate-400 hover:text-red-600"><Trash2 size={14} /></button>
+                    {canEdit ? <>
+                      <button onClick={() => openEdit(p)} className="text-slate-400 hover:text-[#2B4C7E] mr-2 text-xs">Edit</button>
+                      <button onClick={() => removeProduct(p.id)} className="text-slate-400 hover:text-red-600"><Trash2 size={14} /></button>
+                    </> : <span className="text-slate-300 text-xs">—</span>}
                   </td>
                 </tr>
               );
@@ -1416,7 +1448,7 @@ function StockHub({ data, setData, save, user }) {
       {allowedTabs.length === 0 ? <NoRegistersNotice module="Stock" /> : (
         <>
           <TabBar tabs={allowedTabs} active={tab} onChange={setTab} />
-          {tab === "levels" && <StockLevels data={data} setData={setData} save={save} />}
+          {tab === "levels" && <StockLevels data={data} setData={setData} save={save} user={user} />}
           {tab === "lowStock" && <LowStockReport data={data} />}
           {tab === "repack" && <RepackRegister data={data} setData={setData} save={save} user={user} />}
           {tab === "returns" && <GoodsReturnsRegister data={data} setData={setData} save={save} user={user} />}
@@ -1799,9 +1831,16 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
                 items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total,
                 settings: data.invoiceSettings,
               })} disabled={!isAndroid()} className={!isAndroid() ? "opacity-50" : ""}>
-                <Printer size={14} /> Print receipt (Bluetooth)
+                <Printer size={14} /> Print receipt (Bluetooth Print app)
               </Btn>
-              {!isAndroid() && <span className="text-[11px] text-slate-400 self-center">Bluetooth receipt printing works from an Android phone with the Bluetooth Print app installed.</span>}
+              <Btn variant="outline" onClick={() => printViaBluetoothChooser({
+                number: current.number, date: current.date, partyName: current.customer,
+                items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total,
+                settings: data.invoiceSettings,
+              })} disabled={!canChooserPrint()} className={!canChooserPrint() ? "opacity-50" : ""}>
+                <Printer size={14} /> Print receipt (choose app)
+              </Btn>
+              {!isAndroid() && <span className="text-[11px] text-slate-400 self-center">Bluetooth receipt printing works from an Android phone. "Bluetooth Print app" needs that specific app installed — "choose app" lets you pick any printer app you have (RawBT, PrintHand, etc).</span>}
               {current.paymentType === "credit" && current.paidStatus !== "paid" && (
                 <Btn variant="amber" onClick={() => openPaymentForm(current)}><Check size={14} /> Record payment</Btn>
               )}
@@ -2885,13 +2924,13 @@ function AccountingHub({ data, user }) {
 function UsersSettings({ users, refreshUsers, locations }) {
   const [showForm, setShowForm] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
-  const blank = { name: "", username: "", password: "", permissions: {}, registerPermissions: {}, locationIds: [] };
+  const blank = { name: "", username: "", password: "", permissions: {}, registerPermissions: {}, locationIds: [], stockEditRights: false };
   const [form, setForm] = useState(blank);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   const openNew = () => { setForm(blank); setEditingUser(null); setError(""); setShowForm(true); };
-  const openEdit = (u) => { setForm({ name: u.name, username: u.username, password: "", permissions: u.permissions || {}, registerPermissions: u.registerPermissions || {}, locationIds: u.locationIds || [] }); setEditingUser(u); setError(""); setShowForm(true); };
+  const openEdit = (u) => { setForm({ name: u.name, username: u.username, password: "", permissions: u.permissions || {}, registerPermissions: u.registerPermissions || {}, locationIds: u.locationIds || [], stockEditRights: !!u.stockEditRights }); setEditingUser(u); setError(""); setShowForm(true); };
 
   const toggleModule = (moduleId) => {
     const turningOn = !form.permissions[moduleId];
@@ -2917,6 +2956,7 @@ function UsersSettings({ users, refreshUsers, locations }) {
         await setDoc(doc(db, "users", editingUser.id), {
           name: form.name, username: editingUser.username, isAdmin: false,
           permissions: form.permissions, registerPermissions: form.registerPermissions, locationIds: form.locationIds,
+          stockEditRights: !!form.stockEditRights,
         });
       } else {
         if (form.password.length < 6) { setError("Password needs at least 6 characters."); setBusy(false); return; }
@@ -2925,6 +2965,7 @@ function UsersSettings({ users, refreshUsers, locations }) {
         await setDoc(doc(db, "users", cred.user.uid), {
           name: form.name, username: form.username.trim().toLowerCase(), isAdmin: false,
           permissions: form.permissions, registerPermissions: form.registerPermissions, locationIds: form.locationIds,
+          stockEditRights: !!form.stockEditRights,
         });
         await signOut(authInstance);
         appInstance.delete && appInstance.delete();
@@ -2965,6 +3006,7 @@ function UsersSettings({ users, refreshUsers, locations }) {
                   {u.isAdmin ? <Tag tone="good">Full access</Tag> :
                     <div className="flex flex-wrap gap-1">
                       {MODULES.filter((m) => u.permissions && u.permissions[m.id]).map((m) => <Tag key={m.id}>{m.label}</Tag>)}
+                      {u.stockEditRights && <Tag tone="good">Stock edit</Tag>}
                       {!(u.permissions && Object.values(u.permissions).some(Boolean)) && <span className="text-slate-400 text-xs">None</span>}
                     </div>}
                 </td>
@@ -3028,6 +3070,16 @@ function UsersSettings({ users, refreshUsers, locations }) {
                   ))}
                 </div>
               </Field>
+
+              {form.permissions.stock && (
+                <Field label="Stock editing">
+                  <label className="flex items-center gap-2 text-sm cursor-pointer">
+                    <input type="checkbox" checked={!!form.stockEditRights} onChange={() => setForm({ ...form, stockEditRights: !form.stockEditRights })} />
+                    Can add, edit, delete, or import products in Stock Levels
+                  </label>
+                  <p className="text-xs text-slate-400 mt-1">Off by default — without this, they can view Stock Levels and reports but can't change the product list.</p>
+                </Field>
+              )}
 
               <Field label="Locations this person can access">
                 <div className="grid grid-cols-2 gap-1.5 mt-1">
