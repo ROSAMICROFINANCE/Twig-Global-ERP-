@@ -14,7 +14,7 @@ import {
   signOut, setPersistence, browserSessionPersistence
 } from "firebase/auth";
 import {
-  doc, getDoc, setDoc, updateDoc, onSnapshot, collection, deleteDoc, getDocs, query, orderBy, limit
+  doc, getDoc, setDoc, updateDoc, onSnapshot, collection, deleteDoc, getDocs, query, orderBy, limit, runTransaction
 } from "firebase/firestore";
 import { auth, db, getSecondaryAuth, toAuthEmail } from "./firebase";
 
@@ -78,6 +78,7 @@ const REGISTERS = {
     { id: "repack", label: "Repackaging" },
     { id: "returns", label: "Goods Returns" },
     { id: "stocktake", label: "Stocktake" },
+    { id: "itemHistory", label: "Item History" },
   ],
   accounting: [
     { id: "costing", label: "Costing" },
@@ -154,6 +155,40 @@ async function saveLocationData(locationId, changes) {
   // pretending the save worked.
   await updateDoc(locationDocRef(locationId), changes);
 }
+
+// Race-safe save for anything that appends to or edits a shared list —
+// sales orders, stock levels, payments, purchase orders, transfers,
+// repacks, returns, loan returns, stocktakes, quotes, expenses, counters.
+// A plain updateDoc (above) is only safe when the caller already knows the
+// exact final value of every field it's touching. But an "append a new
+// order to the list" or "deduct stock for this sale" save is normally
+// built from this device's own local copy of the data — and if another
+// device (or another tab, or a flaky connection on this same device)
+// writes to one of those SAME fields a moment earlier, this device's save
+// still goes out built from the OLD copy, silently overwriting the other
+// write. That is how a sales order can appear to save successfully and
+// then vanish, while the stock it deducted stays deducted — the new
+// order never had a chance to be included in the stale array this write
+// sent back to the server.
+// This function closes that gap: it reads the location's document fresh
+// from the server at the moment of the write, lets the caller compute the
+// new field values against THAT fresh copy (not local state), and commits
+// everything in one atomic transaction. If another write lands in the
+// (usually tiny) window between the read and the commit, Firestore
+// automatically re-runs the whole transaction against the newer data —
+// so two near-simultaneous saves merge instead of one quietly erasing
+// the other.
+async function saveLocationDataTransactional(locationId, computeChanges) {
+  const ref = locationDocRef(locationId);
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(ref);
+    const fresh = mergeWithDefaults(snap.exists() ? snap.data() : {});
+    const changes = computeChanges(fresh);
+    tx.update(ref, changes);
+    return { fresh, changes };
+  });
+}
+
 async function saveLocationsList(list) {
   try { await setDoc(LOCATIONS_DOC, { list }); } catch (e) { console.error("Save failed", e); }
 }
@@ -819,6 +854,10 @@ function StockLevels({ data, setData, save, user }) {
   const submit = (e) => {
     e.preventDefault();
     if (!canEdit) return;
+    // Optimistic local update for a snappy feel, computed from what's on
+    // screen right now — then the actual write is built fresh against the
+    // server's latest copy, so it can't clobber a product another device
+    // added or edited a moment ago, and the result is reconciled back in.
     let products, counters = data.counters;
     if (editing) {
       products = data.products.map((p) => (p.id === editing ? { ...p, ...form, sku: p.sku, unit: "pc" } : p));
@@ -827,16 +866,26 @@ function StockLevels({ data, setData, save, user }) {
       products = [...data.products, { ...form, sku, unit: "pc", id: uid(), createdAt: todayISO(), lastRestocked: todayISO() }];
       counters = { ...data.counters, product: data.counters.product + 1 };
     }
-    const next = { ...data, products, counters };
-    setData(next); save({ products, counters });
+    setData({ ...data, products, counters });
+    save((fresh) => {
+      let products, counters = fresh.counters;
+      if (editing) {
+        products = fresh.products.map((p) => (p.id === editing ? { ...p, ...form, sku: p.sku, unit: "pc" } : p));
+      } else {
+        const sku = nextProductCode(fresh.counters.product);
+        products = [...fresh.products, { ...form, sku, unit: "pc", id: uid(), createdAt: todayISO(), lastRestocked: todayISO() }];
+        counters = { ...fresh.counters, product: fresh.counters.product + 1 };
+      }
+      return { products, counters };
+    }).then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
     setShowForm(false);
   };
 
   const removeProduct = (id) => {
     if (!canEdit) return;
-    const products = data.products.filter((p) => p.id !== id);
-    const next = { ...data, products };
-    setData(next); save({ products });
+    setData({ ...data, products: data.products.filter((p) => p.id !== id) });
+    save((fresh) => ({ products: fresh.products.filter((p) => p.id !== id) }))
+      .then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
   };
 
   const downloadTemplate = () => {
@@ -864,24 +913,28 @@ function StockLevels({ data, setData, save, user }) {
         }
         return undefined;
       };
-      let counter = data.counters.product;
-      const imported = rows.map((r) => {
-        const sku = nextProductCode(counter); counter++;
-        return {
-          id: uid(), sku, unit: "pc",
-          name: norm(r, ["name", "product", "product name"]) || "Unnamed",
-          category: norm(r, ["category"]) || "",
-          costPrice: Number(norm(r, ["costprice", "cost", "cost price"])) || 0,
-          sellPrice: Number(norm(r, ["sellprice", "price", "sell price", "selling price"])) || 0,
-          stock: Number(norm(r, ["stock", "currentstock", "current stock", "qty", "quantity"])) || 0,
-          minStock: Number(norm(r, ["minstock", "minimum stock", "min stock", "minimum", "reorder level"])) || 0,
-          createdAt: todayISO(), lastRestocked: todayISO(),
-        };
-      });
-      const products = [...data.products, ...imported];
-      const counters = { ...data.counters, product: counter };
-      const next = { ...data, products, counters };
-      setData(next); save({ products, counters });
+      const buildImportedRows = (startCounter) => {
+        let counter = startCounter;
+        return rows.map((r) => {
+          const sku = nextProductCode(counter); counter++;
+          return {
+            id: uid(), sku, unit: "pc",
+            name: norm(r, ["name", "product", "product name"]) || "Unnamed",
+            category: norm(r, ["category"]) || "",
+            costPrice: Number(norm(r, ["costprice", "cost", "cost price"])) || 0,
+            sellPrice: Number(norm(r, ["sellprice", "price", "sell price", "selling price"])) || 0,
+            stock: Number(norm(r, ["stock", "currentstock", "current stock", "qty", "quantity"])) || 0,
+            minStock: Number(norm(r, ["minstock", "minimum stock", "min stock", "minimum", "reorder level"])) || 0,
+            createdAt: todayISO(), lastRestocked: todayISO(),
+          };
+        });
+      };
+      const imported = buildImportedRows(data.counters.product);
+      setData({ ...data, products: [...data.products, ...imported], counters: { ...data.counters, product: data.counters.product + imported.length } });
+      await save((fresh) => {
+        const importedFresh = buildImportedRows(fresh.counters.product);
+        return { products: [...fresh.products, ...importedFresh], counters: { ...fresh.counters, product: fresh.counters.product + importedFresh.length } };
+      }).then(({ fresh, changes }) => setData({ ...fresh, ...changes }));
     } catch (err) {
       alert("Could not read that file. Use the downloadable template — columns: Name, Category, Cost Price, Sell Price, Current Stock, Minimum Stock.");
     }
@@ -989,17 +1042,20 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
     if (!product) return;
     const qty = Number(form.qty) || 0;
     const stockChange = form.type === "good" ? qty : -qty;
-    const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + stockChange } : p));
-    const entry = {
-      id: uid(), number: nextNumber("RET", data.counters.ret), date: todayISO(),
-      type: form.type, productId: form.productId, productName: product.name, qty,
-      reason: form.reason, processedBy: user.username,
-      value: form.type === "damaged" ? qty * product.costPrice : 0,
-    };
-    const returns = [entry, ...data.returns];
-    const counters = { ...data.counters, ret: data.counters.ret + 1 };
-    const next = { ...data, products, returns, counters };
-    setData(next); save({ products, returns, counters });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + stockChange } : p)) });
+    save((fresh) => {
+      const freshProduct = fresh.products.find((p) => p.id === form.productId) || product;
+      const products = fresh.products.map((p) => (p.id === form.productId ? { ...p, stock: p.stock + stockChange } : p));
+      const entry = {
+        id: uid(), number: nextNumber("RET", fresh.counters.ret), date: todayISO(),
+        type: form.type, productId: form.productId, productName: freshProduct.name, qty,
+        reason: form.reason, processedBy: user.username,
+        value: form.type === "damaged" ? qty * freshProduct.costPrice : 0,
+      };
+      const returns = [entry, ...fresh.returns];
+      const counters = { ...fresh.counters, ret: fresh.counters.ret + 1 };
+      return { products, returns, counters };
+    }).then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
     setForm(blank); setShowForm(false);
   };
 
@@ -1086,21 +1142,27 @@ function RepackRegister({ data, setData, save, user }) {
     if (sourceQty <= 0 || yieldPerUnit <= 0) { alert("Enter a quantity and a yield greater than zero."); return; }
     if (source.stock < sourceQty) { if (!confirm(`Only ${source.stock} of ${source.name} in stock. Repack anyway?`)) return; }
     const unitCost = targetQty > 0 ? (source.costPrice * sourceQty) / targetQty : target.costPrice;
-    const products = data.products.map((p) => {
+    setData({ ...data, products: data.products.map((p) => {
       if (p.id === source.id) return { ...p, stock: p.stock - sourceQty };
       if (p.id === target.id) return { ...p, stock: p.stock + targetQty, costPrice: unitCost, lastRestocked: todayISO() };
       return p;
-    });
-    const entry = {
-      id: uid(), number: nextNumber("RPK", data.counters.repack), date: todayISO(),
-      sourceProductId: source.id, sourceName: source.name, sourceQty,
-      targetProductId: target.id, targetName: target.name, targetQty, yieldPerUnit, unitCost,
-      createdBy: user.username,
-    };
-    const repacks = [entry, ...data.repacks];
-    const counters = { ...data.counters, repack: data.counters.repack + 1 };
-    const next = { ...data, products, repacks, counters };
-    setData(next); save({ products, repacks, counters });
+    }) });
+    save((fresh) => {
+      const products = fresh.products.map((p) => {
+        if (p.id === source.id) return { ...p, stock: p.stock - sourceQty };
+        if (p.id === target.id) return { ...p, stock: p.stock + targetQty, costPrice: unitCost, lastRestocked: todayISO() };
+        return p;
+      });
+      const entry = {
+        id: uid(), number: nextNumber("RPK", fresh.counters.repack), date: todayISO(),
+        sourceProductId: source.id, sourceName: source.name, sourceQty,
+        targetProductId: target.id, targetName: target.name, targetQty, yieldPerUnit, unitCost,
+        createdBy: user.username,
+      };
+      const repacks = [entry, ...fresh.repacks];
+      const counters = { ...fresh.counters, repack: fresh.counters.repack + 1 };
+      return { products, repacks, counters };
+    }).then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
     setForm(blank); setShowForm(false);
   };
 
@@ -1225,6 +1287,136 @@ function LowStockReport({ data }) {
 }
 
 /* ---------------------------------------------------------
+   Item History — search for one product, see every movement
+   that touched its stock: sales, purchases received, returns,
+   repacks (as source or target), transfers in/out, loan returns.
+   Stocktake count adjustments aren't itemized per product today
+   (only a day-level summary is kept), so they don't appear here.
+--------------------------------------------------------- */
+function buildItemHistory(data, productId) {
+  const rows = [];
+  (data.salesOrders || []).forEach((o) => {
+    o.items.filter((l) => l.productId === productId).forEach((l) => {
+      rows.push({
+        date: o.date, time: o.time || "", type: "Sale", ref: o.number,
+        detail: `Sold to ${o.customer}`, qtyChange: -l.qty, qty: l.qty,
+      });
+    });
+  });
+  (data.purchaseOrders || []).filter((p) => p.status === "received").forEach((p) => {
+    p.items.filter((l) => l.productId === productId).forEach((l) => {
+      rows.push({
+        date: p.receivedDate || p.date, time: "", type: "Purchase received", ref: p.number,
+        detail: `From ${p.supplier}`, qtyChange: l.qty, qty: l.qty,
+      });
+    });
+  });
+  (data.returns || []).filter((r) => r.productId === productId).forEach((r) => {
+    rows.push({
+      date: r.date, time: "", type: r.type === "good" ? "Return (good)" : "Return (damaged)", ref: r.number,
+      detail: r.reason || "", qtyChange: r.type === "good" ? r.qty : -r.qty, qty: r.qty,
+    });
+  });
+  (data.repacks || []).forEach((rp) => {
+    if (rp.sourceProductId === productId) {
+      rows.push({ date: rp.date, time: "", type: "Repack (used as source)", ref: rp.number, detail: `Into ${rp.targetName}`, qtyChange: -rp.sourceQty, qty: rp.sourceQty });
+    }
+    if (rp.targetProductId === productId) {
+      rows.push({ date: rp.date, time: "", type: "Repack (produced)", ref: rp.number, detail: `From ${rp.sourceName}`, qtyChange: rp.targetQty, qty: rp.targetQty });
+    }
+  });
+  (data.transfers || []).filter((t) => t.productId === productId).forEach((t) => {
+    rows.push({
+      date: t.date, time: "", type: t.type === "out" ? "Transfer out" : "Transfer in (borrowed)", ref: t.number,
+      detail: t.party ? `${t.type === "out" ? "To" : "From"} ${t.party}` : "", qtyChange: t.type === "out" ? -t.qty : t.qty, qty: t.qty,
+    });
+  });
+  (data.loanReturns || []).filter((r) => r.productId === productId).forEach((r) => {
+    rows.push({ date: r.date, time: "", type: "Loan return (ours, back)", ref: r.number, detail: r.party ? `From ${r.party}` : "", qtyChange: r.qty, qty: r.qty });
+  });
+  return rows.sort((a, b) => (a.date === b.date ? (a.time || "").localeCompare(b.time || "") : a.date.localeCompare(b.date)));
+}
+
+function ItemHistoryReport({ data }) {
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState("");
+
+  const matches = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return [];
+    return data.products.filter((p) => (p.name + " " + p.sku + " " + p.category).toLowerCase().includes(q)).slice(0, 20);
+  }, [search, data.products]);
+
+  const selected = data.products.find((p) => p.id === selectedId);
+  const history = useMemo(() => (selected ? buildItemHistory(data, selected.id) : []), [data, selected]);
+
+  const pick = (p) => { setSelectedId(p.id); setSearch(""); };
+
+  return (
+    <div>
+      <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Item History</h2>
+      <p className="text-sm text-slate-500 mb-4">Search for a product to see everything that's moved its stock — sales, purchases received, returns, repacks, and transfers — oldest first.</p>
+
+      <div className="relative max-w-md mb-2">
+        <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
+        <input
+          className="w-full border border-slate-200 rounded-md pl-8 pr-3 py-2 text-sm"
+          placeholder="Search by product name or code…"
+          value={search}
+          onChange={(e) => { setSearch(e.target.value); }}
+        />
+        {matches.length > 0 && (
+          <div className="absolute z-10 mt-1 w-full bg-white border border-slate-200 rounded-md shadow-lg max-h-64 overflow-y-auto">
+            {matches.map((p) => (
+              <div key={p.id} onClick={() => pick(p)} className="px-3 py-2 text-sm hover:bg-slate-50 cursor-pointer flex justify-between">
+                <span>{p.name}</span><span className="text-slate-400 font-mono text-xs">{p.sku}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {!selected && <div className="text-sm text-slate-400 mt-6">Search above and pick a product to see its history.</div>}
+
+      {selected && (
+        <div className="mt-4">
+          <div className="border border-slate-200 rounded-lg bg-white p-4 mb-4 flex flex-wrap gap-6 items-center">
+            <div><div className="text-[11px] font-mono uppercase text-slate-400">Product</div><div className="font-semibold">{selected.name}</div></div>
+            <div><div className="text-[11px] font-mono uppercase text-slate-400">Code</div><div className="font-mono text-sm">{selected.sku}</div></div>
+            <div><div className="text-[11px] font-mono uppercase text-slate-400">Current stock</div><div className="font-mono text-sm">{selected.stock}</div></div>
+            <Btn variant="ghost" onClick={() => setSelectedId("")}>Search a different product</Btn>
+          </div>
+          <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Type</th>
+                  <th className="text-left px-3 py-2">Reference</th><th className="text-left px-3 py-2">Detail</th>
+                  <th className="text-right px-3 py-2">Qty</th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((h, i) => (
+                  <tr key={i} className="border-t border-slate-100">
+                    <td className="px-3 py-2 font-mono text-xs">{formatDateLabel(h.date)}{h.time ? ` · ${h.time}` : ""}</td>
+                    <td className="px-3 py-2">{h.type}</td>
+                    <td className="px-3 py-2 font-mono text-xs text-slate-500">{h.ref}</td>
+                    <td className="px-3 py-2 text-slate-500">{h.detail}</td>
+                    <td className={`px-3 py-2 text-right font-mono ${h.qtyChange > 0 ? "text-emerald-600" : "text-red-600"}`}>{h.qtyChange > 0 ? "+" : ""}{h.qtyChange}</td>
+                  </tr>
+                ))}
+                {history.length === 0 && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm">No recorded movement yet for this product.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-slate-400 mt-2">Note: stocktake count corrections aren't itemized per product yet — only the overall day's totals are kept in the Stocktake report.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
    Stocktake — download a sheet with system quantities,
    re-import the counted sheet, and reconcile variances
    before anything is applied to live stock.
@@ -1323,14 +1515,17 @@ function StocktakeRegister({ data, setData, save }) {
     setApplying(true);
     try {
       const updates = new Map(countedRows.map((r) => [r.id, r.countedStock]));
-      const products = data.products.map((p) => (updates.has(p.id) ? { ...p, stock: updates.get(p.id) } : p));
-      const stocktakeRecord = {
-        id: uid(), date: sheetDate || todayISO(), time: nowTime(),
-        itemsCounted: countedRows.length, itemsVaried: variances.length, valueImpact: totalValueImpact,
-      };
-      const stocktakes = [stocktakeRecord, ...(data.stocktakes || [])].slice(0, 50);
-      setData({ ...data, products, stocktakes });
-      await save({ products, stocktakes });
+      setData({ ...data, products: data.products.map((p) => (updates.has(p.id) ? { ...p, stock: updates.get(p.id) } : p)) });
+      const { fresh, changes } = await save((fresh) => {
+        const products = fresh.products.map((p) => (updates.has(p.id) ? { ...p, stock: updates.get(p.id) } : p));
+        const stocktakeRecord = {
+          id: uid(), date: sheetDate || todayISO(), time: nowTime(),
+          itemsCounted: countedRows.length, itemsVaried: variances.length, valueImpact: totalValueImpact,
+        };
+        const stocktakes = [stocktakeRecord, ...(fresh.stocktakes || [])].slice(0, 50);
+        return { products, stocktakes };
+      });
+      setData({ ...fresh, ...changes });
       setRecon(null);
       setUnmatched([]);
     } catch (err) {
@@ -1453,6 +1648,7 @@ function StockHub({ data, setData, save, user }) {
           {tab === "repack" && <RepackRegister data={data} setData={setData} save={save} user={user} />}
           {tab === "returns" && <GoodsReturnsRegister data={data} setData={setData} save={save} user={user} />}
           {tab === "stocktake" && <StocktakeRegister data={data} setData={setData} save={save} />}
+          {tab === "itemHistory" && <ItemHistoryReport data={data} />}
         </>
       )}
     </div>
@@ -1517,15 +1713,16 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
 
   const submit = async (e) => {
     e.preventDefault();
-    const number = nextNumber("QUO", data.counters.quote);
-    const quote = { id: uid(), number, customer, date: todayISO(), items, total, status: "draft", createdBy: user.username };
-    const quotes = [quote, ...data.quotes];
-    const counters = { ...data.counters, quote: data.counters.quote + 1 };
-    const next = { ...data, quotes, counters };
     setSaving(true); setSaveError(false);
     try {
-      await save({ quotes, counters });
-      setData(next);
+      const { fresh, changes } = await save((fresh) => {
+        const number = nextNumber("QUO", fresh.counters.quote);
+        const quote = { id: uid(), number, customer, date: todayISO(), items, total, status: "draft", createdBy: user.username };
+        const quotes = [quote, ...fresh.quotes];
+        const counters = { ...fresh.counters, quote: fresh.counters.quote + 1 };
+        return { quotes, counters };
+      });
+      setData({ ...fresh, ...changes });
       clearDraft(); setForm(blankForm);
       setMode("list");
     } catch (err) {
@@ -1536,38 +1733,40 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
   };
 
   const convertToSalesOrder = async (quote) => {
-    const insufficient = quote.items.filter((l) => {
-      const p = data.products.find((p) => p.id === l.productId);
-      return p && l.qty > p.stock;
-    });
-    if (insufficient.length > 0) {
-      alert("Can't convert to a sales order — not enough stock for: " + insufficient.map((l) => {
-        const p = data.products.find((p) => p.id === l.productId);
-        return `${p.name} (have ${p.stock}, need ${l.qty})`;
-      }).join(", ") + ". Adjust the quantities or wait for restock.");
-      return;
-    }
-    const number = nextNumber("SO", data.counters.sales);
-    const soItems = quote.items.map((l) => {
-      const p = data.products.find((p) => p.id === l.productId);
-      return { ...l, cost: p ? p.costPrice : 0 };
-    });
-    const salesOrder = { id: uid(), number, customer: quote.customer, date: todayISO(), time: nowTime(), items: soItems, total: quote.total, quoteId: quote.id, createdBy: user.username, paymentType: "cash", paidStatus: "paid" };
-    const products = data.products.map((p) => {
-      const l = quote.items.find((l) => l.productId === p.id);
-      return l ? { ...p, stock: p.stock - l.qty } : p;
-    });
-    const quotes = data.quotes.map((q) => (q.id === quote.id ? { ...q, status: "converted" } : q));
-    const salesOrders = [salesOrder, ...data.salesOrders];
-    const counters = { ...data.counters, sales: data.counters.sales + 1 };
-    const next = { ...data, products, quotes, salesOrders, counters };
     setConverting(true);
     try {
-      await save({ products, quotes, salesOrders, counters });
-      setData(next);
+      const { fresh, changes } = await save((fresh) => {
+        const insufficient = quote.items.filter((l) => {
+          const p = fresh.products.find((p) => p.id === l.productId);
+          return p && l.qty > p.stock;
+        });
+        if (insufficient.length > 0) {
+          throw new Error("Can't convert to a sales order — not enough stock for: " + insufficient.map((l) => {
+            const p = fresh.products.find((p) => p.id === l.productId);
+            return `${p.name} (have ${p.stock}, need ${l.qty})`;
+          }).join(", ") + ". Adjust the quantities or wait for restock.");
+        }
+        const number = nextNumber("SO", fresh.counters.sales);
+        const soItems = quote.items.map((l) => {
+          const p = fresh.products.find((p) => p.id === l.productId);
+          return { ...l, cost: p ? p.costPrice : 0 };
+        });
+        const salesOrder = { id: uid(), number, customer: quote.customer, date: todayISO(), time: nowTime(), items: soItems, total: quote.total, quoteId: quote.id, createdBy: user.username, paymentType: "cash", paidStatus: "paid" };
+        const products = fresh.products.map((p) => {
+          const l = quote.items.find((l) => l.productId === p.id);
+          return l ? { ...p, stock: p.stock - l.qty } : p;
+        });
+        const quotes = fresh.quotes.map((q) => (q.id === quote.id ? { ...q, status: "converted" } : q));
+        const salesOrders = [salesOrder, ...fresh.salesOrders];
+        const counters = { ...fresh.counters, sales: fresh.counters.sales + 1 };
+        return { products, quotes, salesOrders, counters };
+      });
+      setData({ ...fresh, ...changes });
       setMode("list");
     } catch (err) {
-      alert("Couldn't reach the cloud storage — the conversion wasn't saved. Nothing has changed; try again once your connection is back.");
+      alert(err && err.message && err.message.startsWith("Can't convert")
+        ? err.message
+        : "Couldn't reach the cloud storage — the conversion wasn't saved. Nothing has changed; try again once your connection is back.");
     } finally {
       setConverting(false);
     }
@@ -1691,24 +1890,39 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
       }).join(", ") + ". A sales order can't sell more than what's in the system — use a Quotation instead if you need to quote ahead of stock.");
       return;
     }
-    const number = nextNumber("SO", data.counters.sales);
     const soItems = items.map((l) => { const p = data.products.find((p) => p.id === l.productId); return { ...l, cost: p ? p.costPrice : 0 }; });
-    const salesOrder = {
-      id: uid(), number, customer, date: todayISO(), time: nowTime(), items: soItems, total, createdBy: user.username,
-      paymentType, paidStatus: paymentType === "credit" ? "unpaid" : "paid", amountPaid: paymentType === "credit" ? 0 : total,
-    };
-    const products = data.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: p.stock - l.qty } : p; });
-    const salesOrders = [salesOrder, ...data.salesOrders];
-    const counters = { ...data.counters, sales: data.counters.sales + 1 };
-    const next = { ...data, products, salesOrders, counters };
     setSaving(true); setSaveError(false);
     try {
-      await save({ products, salesOrders, counters });
-      setData(next);
+      const { fresh, changes } = await save((fresh) => {
+        // Built against the server's freshest copy, not this device's local
+        // `data` — so a near-simultaneous save from another device (or
+        // another action on this device) can't silently erase this order.
+        const stillInsufficient = items.filter((l) => {
+          const p = fresh.products.find((p) => p.id === l.productId);
+          return p && l.qty > p.stock;
+        });
+        if (stillInsufficient.length > 0) {
+          throw new Error("Stock changed just before this saved — not enough left for: " + stillInsufficient.map((l) => {
+            const p = fresh.products.find((p) => p.id === l.productId);
+            return `${p.name} (have ${p.stock}, need ${l.qty})`;
+          }).join(", "));
+        }
+        const number = nextNumber("SO", fresh.counters.sales);
+        const salesOrder = {
+          id: uid(), number, customer, date: todayISO(), time: nowTime(), items: soItems, total, createdBy: user.username,
+          paymentType, paidStatus: paymentType === "credit" ? "unpaid" : "paid", amountPaid: paymentType === "credit" ? 0 : total,
+        };
+        const products = fresh.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: p.stock - l.qty } : p; });
+        const salesOrders = [salesOrder, ...fresh.salesOrders];
+        const counters = { ...fresh.counters, sales: fresh.counters.sales + 1 };
+        return { products, salesOrders, counters };
+      });
+      setData({ ...fresh, ...changes });
       clearDraft(); setForm(blankForm);
       setMode("list");
     } catch (err) {
       setSaveError(true);
+      if (err && err.message && err.message.startsWith("Stock changed")) alert(err.message);
     } finally {
       setSaving(false);
     }
@@ -1731,15 +1945,21 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
     const paidDate = todayISO();
     const newAmountPaid = (order.amountPaid || 0) + amount;
     const newStatus = newAmountPaid >= order.total ? "paid" : "partial";
-    const salesOrders = data.salesOrders.map((o) => (o.id === order.id ? { ...o, amountPaid: newAmountPaid, paidStatus: newStatus, paidDate: newStatus === "paid" ? paidDate : o.paidDate } : o));
-    const payment = { id: uid(), number: nextNumber("PAY", data.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount, recordedBy: user.username };
-    const payments = [payment, ...data.payments];
-    const counters = { ...data.counters, pay: data.counters.pay + 1 };
-    const next = { ...data, salesOrders, payments, counters };
     setPayingBusy(true);
     try {
-      await save({ salesOrders, payments, counters });
-      setData(next);
+      const { fresh, changes } = await save((fresh) => {
+        // Map over the server's freshest salesOrders list, not this device's
+        // local copy — this is exactly the save that used to be able to
+        // silently delete a brand-new order from another device: mapping
+        // over a stale local array and writing the whole field back
+        // overwrites anything added to it since this device last synced.
+        const salesOrders = fresh.salesOrders.map((o) => (o.id === order.id ? { ...o, amountPaid: newAmountPaid, paidStatus: newStatus, paidDate: newStatus === "paid" ? paidDate : o.paidDate } : o));
+        const payment = { id: uid(), number: nextNumber("PAY", fresh.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount, recordedBy: user.username };
+        const payments = [payment, ...fresh.payments];
+        const counters = { ...fresh.counters, pay: fresh.counters.pay + 1 };
+        return { salesOrders, payments, counters };
+      });
+      setData({ ...fresh, ...changes });
       setCurrent({ ...order, amountPaid: newAmountPaid, paidStatus: newStatus });
       setShowPaymentForm(false);
     } catch (err) {
@@ -1948,23 +2168,20 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
 
   const submit = async (e) => {
     e.preventDefault();
-    let changes, next;
-    if (editingId) {
-      const purchaseOrders = data.purchaseOrders.map((p) => (p.id === editingId ? { ...p, supplier, items, total } : p));
-      changes = { purchaseOrders };
-      next = { ...data, purchaseOrders };
-    } else {
-      const number = nextNumber("PO", data.counters.purchase);
-      const po = { id: uid(), number, supplier, date: todayISO(), items, total, status: "pending", createdBy: user.username };
-      const purchaseOrders = [po, ...data.purchaseOrders];
-      const counters = { ...data.counters, purchase: data.counters.purchase + 1 };
-      changes = { purchaseOrders, counters };
-      next = { ...data, purchaseOrders, counters };
-    }
     setSaving(true); setSaveError(false);
     try {
-      await save(changes);
-      setData(next);
+      const { fresh, changes } = await save((fresh) => {
+        if (editingId) {
+          const purchaseOrders = fresh.purchaseOrders.map((p) => (p.id === editingId ? { ...p, supplier, items, total } : p));
+          return { purchaseOrders };
+        }
+        const number = nextNumber("PO", fresh.counters.purchase);
+        const po = { id: uid(), number, supplier, date: todayISO(), items, total, status: "pending", createdBy: user.username };
+        const purchaseOrders = [po, ...fresh.purchaseOrders];
+        const counters = { ...fresh.counters, purchase: fresh.counters.purchase + 1 };
+        return { purchaseOrders, counters };
+      });
+      setData({ ...fresh, ...changes });
       clearDraft(); setForm(blankForm); setEditingId(null);
       setMode("list");
     } catch (err) {
@@ -1975,16 +2192,17 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
   };
 
   const markReceived = async (po) => {
-    const products = data.products.map((p) => {
-      const l = po.items.find((l) => l.productId === p.id);
-      return l ? { ...p, stock: p.stock + l.qty, lastRestocked: todayISO(), costPrice: l.price || p.costPrice } : p;
-    });
-    const purchaseOrders = data.purchaseOrders.map((p) => (p.id === po.id ? { ...p, status: "received", receivedDate: todayISO() } : p));
-    const next = { ...data, products, purchaseOrders };
     setReceiving(true);
     try {
-      await save({ products, purchaseOrders });
-      setData(next);
+      const { fresh, changes } = await save((fresh) => {
+        const products = fresh.products.map((p) => {
+          const l = po.items.find((l) => l.productId === p.id);
+          return l ? { ...p, stock: p.stock + l.qty, lastRestocked: todayISO(), costPrice: l.price || p.costPrice } : p;
+        });
+        const purchaseOrders = fresh.purchaseOrders.map((p) => (p.id === po.id ? { ...p, status: "received", receivedDate: todayISO() } : p));
+        return { products, purchaseOrders };
+      });
+      setData({ ...fresh, ...changes });
       setCurrent({ ...po, status: "received" });
     } catch (err) {
       alert("Couldn't reach the cloud storage — marking this received wasn't saved. Stock hasn't changed; try again once your connection is back.");
@@ -2094,16 +2312,19 @@ function TransferOutRegister({ data, setData, save, user }) {
     if (!product) return;
     const qty = Number(form.qty) || 0;
     if (product.stock < qty) { if (!confirm(`Only ${product.stock} in stock. Send out anyway?`)) return; }
-    const entry = {
-      id: uid(), number: nextNumber("TRF-OUT", data.counters.transfer), type: "out", date: todayISO(),
-      productId: product.id, productName: product.name, qty, party: form.party, notes: form.notes,
-      valueAtCost: qty * product.costPrice, createdBy: user.username,
-    };
-    const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock - qty } : p));
-    const transfers = [entry, ...data.transfers];
-    const counters = { ...data.counters, transfer: data.counters.transfer + 1 };
-    const next = { ...data, products, transfers, counters };
-    setData(next); save({ products, transfers, counters });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock - qty } : p)) });
+    save((fresh) => {
+      const freshProduct = fresh.products.find((p) => p.id === product.id) || product;
+      const entry = {
+        id: uid(), number: nextNumber("TRF-OUT", fresh.counters.transfer), type: "out", date: todayISO(),
+        productId: freshProduct.id, productName: freshProduct.name, qty, party: form.party, notes: form.notes,
+        valueAtCost: qty * freshProduct.costPrice, createdBy: user.username,
+      };
+      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock - qty } : p));
+      const transfers = [entry, ...fresh.transfers];
+      const counters = { ...fresh.counters, transfer: fresh.counters.transfer + 1 };
+      return { products, transfers, counters };
+    }).then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
     setForm(blank); setShowForm(false);
   };
 
@@ -2192,16 +2413,19 @@ function LoanReturnsRegister({ data, setData, save, user }) {
     const qty = Number(form.qty) || 0;
     const remaining = withRemaining(loan).remaining;
     if (qty <= 0 || qty > remaining) { alert(`Enter a quantity between 1 and ${remaining} (what's still outstanding on this transfer).`); return; }
-    const entry = {
-      id: uid(), number: nextNumber("LNR", data.counters.loanReturn), date: todayISO(),
-      transferOutId: loan.id, transferOutNumber: loan.number, productId: product.id, productName: product.name,
-      party: loan.party, qty, notes: form.notes, valueAtCost: qty * product.costPrice, createdBy: user.username,
-    };
-    const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
-    const loanReturns = [entry, ...(data.loanReturns || [])];
-    const counters = { ...data.counters, loanReturn: data.counters.loanReturn + 1 };
-    const next = { ...data, products, loanReturns, counters };
-    setData(next); save({ products, loanReturns, counters });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p)) });
+    save((fresh) => {
+      const freshProduct = fresh.products.find((p) => p.id === product.id) || product;
+      const entry = {
+        id: uid(), number: nextNumber("LNR", fresh.counters.loanReturn), date: todayISO(),
+        transferOutId: loan.id, transferOutNumber: loan.number, productId: freshProduct.id, productName: freshProduct.name,
+        party: loan.party, qty, notes: form.notes, valueAtCost: qty * freshProduct.costPrice, createdBy: user.username,
+      };
+      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
+      const loanReturns = [entry, ...(fresh.loanReturns || [])];
+      const counters = { ...fresh.counters, loanReturn: fresh.counters.loanReturn + 1 };
+      return { products, loanReturns, counters };
+    }).then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
     setForm(blank); setShowForm(false);
   };
 
@@ -2283,16 +2507,19 @@ function TransferInRegister({ data, setData, save, user }) {
     const product = data.products.find((p) => p.id === form.productId);
     if (!product) return;
     const qty = Number(form.qty) || 0;
-    const entry = {
-      id: uid(), number: nextNumber("TRF-IN", data.counters.transfer), type: "in", date: todayISO(),
-      productId: product.id, productName: product.name, qty, party: form.party, notes: form.notes,
-      valueAtCost: qty * product.costPrice, createdBy: user.username,
-    };
-    const products = data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
-    const transfers = [entry, ...data.transfers];
-    const counters = { ...data.counters, transfer: data.counters.transfer + 1 };
-    const next = { ...data, products, transfers, counters };
-    setData(next); save({ products, transfers, counters });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p)) });
+    save((fresh) => {
+      const freshProduct = fresh.products.find((p) => p.id === product.id) || product;
+      const entry = {
+        id: uid(), number: nextNumber("TRF-IN", fresh.counters.transfer), type: "in", date: todayISO(),
+        productId: freshProduct.id, productName: freshProduct.name, qty, party: form.party, notes: form.notes,
+        valueAtCost: qty * freshProduct.costPrice, createdBy: user.username,
+      };
+      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
+      const transfers = [entry, ...fresh.transfers];
+      const counters = { ...fresh.counters, transfer: fresh.counters.transfer + 1 };
+      return { products, transfers, counters };
+    }).then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
     setForm(blank); setShowForm(false);
   };
 
@@ -2469,18 +2696,21 @@ function DailyExpenseRegister({ data, setData, save, user }) {
 
   const submit = (e) => {
     e.preventDefault();
-    const entry = { id: uid(), number: nextNumber("EXP", data.counters.exp), ...form, amount: Number(form.amount), recordedBy: user.username };
-    const expenses = [entry, ...data.expenses];
-    const counters = { ...data.counters, exp: data.counters.exp + 1 };
-    const next = { ...data, expenses, counters };
-    setData(next); save({ expenses, counters });
+    const optimisticEntry = { id: uid(), number: nextNumber("EXP", data.counters.exp), ...form, amount: Number(form.amount), recordedBy: user.username };
+    setData({ ...data, expenses: [optimisticEntry, ...data.expenses], counters: { ...data.counters, exp: data.counters.exp + 1 } });
+    save((fresh) => {
+      const entry = { ...optimisticEntry, number: nextNumber("EXP", fresh.counters.exp) };
+      const expenses = [entry, ...fresh.expenses];
+      const counters = { ...fresh.counters, exp: fresh.counters.exp + 1 };
+      return { expenses, counters };
+    }).then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
     setForm(blank); setShowForm(false);
   };
 
   const removeExpense = (id) => {
-    const expenses = data.expenses.filter((e) => e.id !== id);
-    const next = { ...data, expenses };
-    setData(next); save({ expenses });
+    setData({ ...data, expenses: data.expenses.filter((e) => e.id !== id) });
+    save((fresh) => ({ expenses: fresh.expenses.filter((e) => e.id !== id) }))
+      .then(({ fresh, changes }) => setData({ ...fresh, ...changes })).catch(() => {});
   };
 
   const dayEntries = data.expenses.filter((e) => e.date === filterDate);
@@ -3472,15 +3702,32 @@ export default function App() {
     return () => clearTimeout(t);
   }, [activeLocationId]); // eslint-disable-line
 
+  // `save` accepts two shapes:
+  //  - a plain object of field values (the old behavior — a direct,
+  //    unconditional overwrite of those fields; fine for something only
+  //    one person edits at a time, like invoice settings).
+  //  - a function `(freshServerData) => changes` — the race-safe path.
+  //    Pass a function for anything that appends to or edits a shared
+  //    list (orders, stock, payments, purchase orders, transfers,
+  //    repacks, returns, loan returns, stocktakes, quotes, expenses,
+  //    counters) so the save is always built against the latest data on
+  //    the server, not this device's possibly-stale local copy. On
+  //    success it resolves to { fresh, changes } — merge those into
+  //    local state with setData({ ...fresh, ...changes }) so the screen
+  //    reflects exactly what was actually written.
   const save = (next) => {
     if (!activeLocationId) return Promise.reject(new Error("No active location"));
     setSaveStatus("saving");
-    return saveLocationData(activeLocationId, next)
-      .then(() => {
+    const op = typeof next === "function"
+      ? saveLocationDataTransactional(activeLocationId, next)
+      : saveLocationData(activeLocationId, next);
+    return op
+      .then((result) => {
         lastFailedSaveRef.current = null;
         setSaveStatus("saved");
         clearTimeout(savedIndicatorTimerRef.current);
         savedIndicatorTimerRef.current = setTimeout(() => setSaveStatus("idle"), 2000);
+        return result; // { fresh, changes } when `next` was a function; undefined otherwise
       })
       .catch((err) => {
         console.error("Save failed", err);
