@@ -373,6 +373,32 @@ function ProductPicker({ products, value, onChange }) {
 }
 
 /* ---------------------------------------------------------
+   Connection problem screen — shown instead of the login
+   screen when the app can't confirm (from the server) whether
+   any users exist, so it never mistakes a weak/offline network
+   for "no admin account yet" and offers to create a new one.
+--------------------------------------------------------- */
+function ConnectionErrorScreen({ onRetry }) {
+  return (
+    <div className="min-h-screen bg-[#1F2428] flex items-center justify-center p-4">
+      <div className="w-full max-w-sm bg-white rounded-lg p-6 text-center">
+        <div className="flex flex-col items-center mb-4">
+          <img src={TWIG_LOGO} alt="Twig Global" className="w-36 h-auto mb-4" />
+          <AlertTriangle size={28} className="text-amber-500" />
+        </div>
+        <h2 className="text-base font-semibold text-slate-800 mb-1">Can't connect right now</h2>
+        <p className="text-sm text-slate-500 mb-5">
+          Twig couldn't reach the server. Check your internet connection, then try again. Your data is safe either way.
+        </p>
+        <Btn onClick={onRetry} className="w-full justify-center">
+          <ArrowRight size={14} /> Retry
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
    Login / first-run admin setup / self sign-up
 --------------------------------------------------------- */
 function LoginScreen({ firstRun, onLogin, onCreateAdmin, onSignUp, busy }) {
@@ -3605,6 +3631,12 @@ export default function App() {
   const [data, setData] = useState(emptyData());
   const [users, setUsers] = useState([]);
   const [usersLoaded, setUsersLoaded] = useState(false);
+  // True until a users snapshot arrives confirmed by the server (not just
+  // the empty local cache). A weak/offline connection can otherwise make
+  // the app briefly think zero users exist and offer to create a new
+  // admin account — see cloudConnectionError below.
+  const [usersFromCache, setUsersFromCache] = useState(true);
+  const [cloudConnectionError, setCloudConnectionError] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
@@ -3623,20 +3655,48 @@ export default function App() {
 
   useEffect(() => {
     ensureLocationsList();
-    const unsub = onSnapshot(LOCATIONS_DOC, (snap) => {
-      setLocations(snap.exists() ? (snap.data().list || []) : []);
-      setLocationsLoaded(true);
-    });
+    const unsub = onSnapshot(
+      LOCATIONS_DOC,
+      (snap) => {
+        setLocations(snap.exists() ? (snap.data().list || []) : []);
+        setLocationsLoaded(true);
+        if (!snap.metadata.fromCache) setCloudConnectionError(false);
+      },
+      (err) => {
+        console.error("Locations listener error", err);
+        setCloudConnectionError(true);
+        setLocationsLoaded(true);
+      }
+    );
     return unsub;
   }, []);
 
   useEffect(() => {
-    const unsub = onSnapshot(USERS_COL, (snap) => {
-      setUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      setUsersLoaded(true);
-    });
+    const unsub = onSnapshot(
+      USERS_COL,
+      (snap) => {
+        setUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        setUsersFromCache(snap.metadata.fromCache);
+        setUsersLoaded(true);
+        if (!snap.metadata.fromCache) setCloudConnectionError(false);
+      },
+      (err) => {
+        console.error("Users listener error", err);
+        setCloudConnectionError(true);
+        setUsersLoaded(true);
+      }
+    );
     return unsub;
   }, []);
+
+  // If, after a few seconds, all we have is an empty, cache-only answer
+  // for whether any users exist, treat that as a connection problem
+  // rather than silently offering to create a brand-new admin account.
+  useEffect(() => {
+    if (!(usersLoaded && usersFromCache && users.length === 0)) return;
+    const t = setTimeout(() => setCloudConnectionError(true), 8000);
+    return () => clearTimeout(t);
+  }, [usersLoaded, usersFromCache, users.length]);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (fbUser) => {
@@ -3761,7 +3821,20 @@ export default function App() {
   };
   const handleLogout = () => signOut(auth);
 
-  if (!authChecked || !usersLoaded || !locationsLoaded) {
+  if (cloudConnectionError) {
+    return <>
+      <ConnectionErrorScreen onRetry={() => window.location.reload()} />
+      {showExitWarning && <ExitWarningToast />}
+    </>;
+  }
+
+  // Wait for a server-confirmed read of the users list before deciding
+  // there are zero users (and showing "create the first admin account").
+  // Without this, a weak connection can make the app briefly see an
+  // empty local cache and mistake it for a brand-new system.
+  const usersAnswerPending = usersFromCache && users.length === 0;
+
+  if (!authChecked || !usersLoaded || !locationsLoaded || usersAnswerPending) {
     return <>
       <div className="h-screen flex items-center justify-center bg-[#F4F4F2]"><Loader2 className="animate-spin text-[#2B4C7E]" size={28} /></div>
       {showExitWarning && <ExitWarningToast />}
