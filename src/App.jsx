@@ -27,6 +27,9 @@ const money = (n) =>
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const nowTime = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+// Payment method label — "cash" | "ecocash" | "credit"
+const paymentLabel = (t) => (t === "ecocash" ? "EcoCash" : t === "credit" ? "Credit" : "Cash");
+
 const daysSince = (iso) => {
   if (!iso) return null;
   const d = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
@@ -256,6 +259,7 @@ const Tag = ({ children, tone = "neutral" }) => {
     danger: "bg-red-50 text-red-700 border-red-300",
     good: "bg-emerald-50 text-emerald-700 border-emerald-300",
     pending: "bg-blue-50 text-blue-700 border-blue-300",
+    info: "bg-sky-50 text-sky-700 border-sky-300",
   };
   return (
     <span className={`inline-flex items-center gap-1 text-[11px] font-mono uppercase tracking-wide border px-1.5 py-0.5 rounded ${tones[tone]}`}>
@@ -1057,16 +1061,48 @@ function StockLevels({ data, setData, save, user }) {
   );
 }
 
+// How much of a product, from one specific sales order, has already been
+// refunded in past returns — so a second return against the same order
+// can't refund more than the customer actually paid for.
+function alreadyRefundedQty(data, salesOrderId, productId) {
+  return (data.returns || [])
+    .filter((r) => r.salesOrderId === salesOrderId && r.productId === productId && (r.refundAmount || 0) > 0)
+    .reduce((s, r) => s + (r.qty || 0), 0);
+}
+
 function GoodsReturnsRegister({ data, setData, save, user }) {
   const [showForm, setShowForm] = useState(false);
-  const blank = { type: "good", productId: "", qty: 1, reason: "" };
+  const blank = { type: "good", productId: "", qty: 1, reason: "", refund: false, salesOrderId: "", refundMethod: "cash" };
   const [form, setForm] = useState(blank);
+
+  // Sales orders that actually sold the selected product — most recent first —
+  // so the refund amount comes from what the customer really paid, not today's price.
+  const candidateOrders = useMemo(() => {
+    if (!form.productId) return [];
+    return data.salesOrders
+      .filter((o) => o.items.some((l) => l.productId === form.productId))
+      .map((o) => {
+        const line = o.items.find((l) => l.productId === form.productId);
+        const refundedSoFar = alreadyRefundedQty(data, o.id, form.productId);
+        const remaining = Math.max(0, line.qty - refundedSoFar);
+        return { order: o, price: line.price, soldQty: line.qty, remaining };
+      })
+      .filter((c) => c.remaining > 0)
+      .sort((a, b) => (a.order.date < b.order.date ? 1 : -1));
+  }, [form.productId, data.salesOrders, data.returns]);
+
+  const selected = candidateOrders.find((c) => c.order.id === form.salesOrderId);
+  const qty = Number(form.qty) || 0;
+  const refundAmount = form.refund && selected ? qty * selected.price : 0;
 
   const submit = (e) => {
     e.preventDefault();
     const product = data.products.find((p) => p.id === form.productId);
     if (!product) return;
-    const qty = Number(form.qty) || 0;
+    if (form.refund) {
+      if (!selected) { alert("Pick which sale this item is being returned from."); return; }
+      if (qty <= 0 || qty > selected.remaining) { alert(`Enter a quantity between 1 and ${selected.remaining} (what's left refundable from that sale).`); return; }
+    }
     const stockChange = form.type === "good" ? qty : -qty;
     setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + stockChange } : p)) });
     save((fresh) => {
@@ -1077,6 +1113,10 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
         type: form.type, productId: form.productId, productName: freshProduct.name, qty,
         reason: form.reason, processedBy: user.username,
         value: form.type === "damaged" ? qty * freshProduct.costPrice : 0,
+        ...(form.refund && selected ? {
+          salesOrderId: selected.order.id, salesOrderNumber: selected.order.number, customer: selected.order.customer,
+          refundAmount: qty * selected.price, refundMethod: form.refundMethod,
+        } : {}),
       };
       const returns = [entry, ...fresh.returns];
       const counters = { ...fresh.counters, ret: fresh.counters.ret + 1 };
@@ -1091,12 +1131,12 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
         <h2 className="text-lg font-semibold text-[#1F2428]">Goods Returns</h2>
         <Btn onClick={() => setShowForm(true)}><Plus size={14} /> Record return</Btn>
       </div>
-      <p className="text-sm text-slate-500 mb-4">Good returns go back into stock. Damaged stock is written off and logged as a loss.</p>
+      <p className="text-sm text-slate-500 mb-4">Good returns go back into stock. Damaged stock is written off and logged as a loss. A good return with a cash refund shows up in the Cash Book.</p>
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
             <tr><th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Product</th>
-              <th className="text-right px-3 py-2">Qty</th><th className="text-left px-3 py-2">Type</th><th className="text-left px-3 py-2">Reason</th><th className="text-left px-3 py-2">By</th></tr>
+              <th className="text-right px-3 py-2">Qty</th><th className="text-left px-3 py-2">Type</th><th className="text-right px-3 py-2">Refund</th><th className="text-left px-3 py-2">Reason</th><th className="text-left px-3 py-2">By</th></tr>
           </thead>
           <tbody>
             {data.returns.map((r) => (
@@ -1106,11 +1146,12 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
                 <td className="px-3 py-2">{r.productName}</td>
                 <td className="px-3 py-2 text-right font-mono">{r.qty}</td>
                 <td className="px-3 py-2"><Tag tone={r.type === "good" ? "good" : "danger"}>{r.type === "good" ? "Good return" : "Damaged"}</Tag></td>
+                <td className="px-3 py-2 text-right font-mono">{(r.refundAmount || 0) > 0 ? `${money(r.refundAmount)} · ${r.refundMethod === "ecocash" ? "EcoCash" : "Cash"}` : "—"}</td>
                 <td className="px-3 py-2 text-slate-500">{r.reason}</td>
                 <td className="px-3 py-2 text-slate-500 font-mono text-xs">{r.processedBy}</td>
               </tr>
             ))}
-            {data.returns.length === 0 && <tr><td colSpan={7} className="text-center text-slate-400 py-8 text-sm">No returns recorded yet.</td></tr>}
+            {data.returns.length === 0 && <tr><td colSpan={8} className="text-center text-slate-400 py-8 text-sm">No returns recorded yet.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1126,12 +1167,49 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
                 <div className="flex gap-2">
                   <button type="button" onClick={() => setForm({ ...form, type: "good" })}
                     className={`flex-1 py-1.5 rounded-md text-sm border ${form.type === "good" ? "bg-emerald-50 border-emerald-400 text-emerald-700" : "border-slate-300 text-slate-500"}`}>Good return</button>
-                  <button type="button" onClick={() => setForm({ ...form, type: "damaged" })}
+                  <button type="button" onClick={() => setForm({ ...form, type: "damaged", refund: false })}
                     className={`flex-1 py-1.5 rounded-md text-sm border ${form.type === "damaged" ? "bg-red-50 border-red-400 text-red-700" : "border-slate-300 text-slate-500"}`}>Damaged / write-off</button>
                 </div>
               </Field>
-              <Field label="Product"><ProductPicker products={data.products} value={form.productId} onChange={(id) => setForm({ ...form, productId: id })} /></Field>
-              <Field label="Quantity"><input type="number" min="1" className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
+              <Field label="Product"><ProductPicker products={data.products} value={form.productId} onChange={(id) => setForm({ ...form, productId: id, salesOrderId: "" })} /></Field>
+
+              {form.type === "good" && (
+                <label className="flex items-center gap-2 text-sm text-slate-700">
+                  <input type="checkbox" checked={form.refund} onChange={(e) => setForm({ ...form, refund: e.target.checked, salesOrderId: "" })} />
+                  Refund the customer in cash / EcoCash
+                </label>
+              )}
+
+              {form.refund && (
+                <Field label="Which sale is this from?">
+                  <select className={inputCls} value={form.salesOrderId} onChange={(e) => setForm({ ...form, salesOrderId: e.target.value })}>
+                    <option value="">Select the original sales order…</option>
+                    {candidateOrders.map((c) => (
+                      <option key={c.order.id} value={c.order.id}>
+                        {c.order.number} · {c.order.customer} · {c.order.date} · {money(c.price)} each · {c.remaining} refundable
+                      </option>
+                    ))}
+                  </select>
+                  {form.productId && candidateOrders.length === 0 && (
+                    <p className="text-xs text-amber-600 mt-1">No sale of this product found with anything left to refund.</p>
+                  )}
+                </Field>
+              )}
+
+              <Field label="Quantity"><input type="number" min="1" max={form.refund && selected ? selected.remaining : undefined} className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
+
+              {form.refund && (
+                <Field label="Refund as">
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => setForm({ ...form, refundMethod: "cash" })}
+                      className={`flex-1 py-1.5 rounded-md text-sm border ${form.refundMethod === "cash" ? "bg-emerald-50 border-emerald-400 text-emerald-700" : "border-slate-300 text-slate-500"}`}>Cash</button>
+                    <button type="button" onClick={() => setForm({ ...form, refundMethod: "ecocash" })}
+                      className={`flex-1 py-1.5 rounded-md text-sm border ${form.refundMethod === "ecocash" ? "bg-sky-50 border-sky-400 text-sky-700" : "border-slate-300 text-slate-500"}`}>EcoCash</button>
+                  </div>
+                  {selected && <p className="text-xs text-slate-400 mt-1">Refund amount: <span className="font-mono">{money(refundAmount)}</span> (at the price it was sold for)</p>}
+                </Field>
+              )}
+
               <Field label="Reason"><input className={inputCls} value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} placeholder={form.type === "good" ? "e.g. wrong size ordered" : "e.g. cracked in transit"} /></Field>
               <div className="flex justify-end gap-2 pt-2">
                 <Btn variant="ghost" onClick={() => setShowForm(false)}>Cancel</Btn>
@@ -1897,6 +1975,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
   const [saveError, setSaveError] = useState(false);
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [paymentAmount, setPaymentAmount] = useState(0);
+  const [paymentMethod, setPaymentMethod] = useState("cash");
   const [payingBusy, setPayingBusy] = useState(false);
   const openNew = () => { setMode("form"); };
   const cancelForm = () => { discardDraft(); setMode("list"); };
@@ -1958,10 +2037,11 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
 
   const openPaymentForm = (order) => {
     setPaymentAmount(remainingOn(order));
+    setPaymentMethod("cash");
     setShowPaymentForm(true);
   };
 
-  const recordPayment = async (order, amount) => {
+  const recordPayment = async (order, amount, method) => {
     amount = Number(amount);
     const remaining = remainingOn(order);
     if (!amount || amount <= 0 || amount > remaining) {
@@ -1980,7 +2060,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
         // over a stale local array and writing the whole field back
         // overwrites anything added to it since this device last synced.
         const salesOrders = fresh.salesOrders.map((o) => (o.id === order.id ? { ...o, amountPaid: newAmountPaid, paidStatus: newStatus, paidDate: newStatus === "paid" ? paidDate : o.paidDate } : o));
-        const payment = { id: uid(), number: nextNumber("PAY", fresh.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount, recordedBy: user.username };
+        const payment = { id: uid(), number: nextNumber("PAY", fresh.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount, method, recordedBy: user.username };
         const payments = [payment, ...fresh.payments];
         const counters = { ...fresh.counters, pay: fresh.counters.pay + 1 };
         return { salesOrders, payments, counters };
@@ -2008,6 +2088,8 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
             <div className="flex gap-2">
               <button type="button" onClick={() => setPaymentType("cash")}
                 className={`flex-1 py-1.5 rounded-md text-sm border ${paymentType === "cash" ? "bg-emerald-50 border-emerald-400 text-emerald-700" : "border-slate-300 text-slate-500"}`}>Cash</button>
+              <button type="button" onClick={() => setPaymentType("ecocash")}
+                className={`flex-1 py-1.5 rounded-md text-sm border ${paymentType === "ecocash" ? "bg-sky-50 border-sky-400 text-sky-700" : "border-slate-300 text-slate-500"}`}>EcoCash</button>
               <button type="button" onClick={() => setPaymentType("credit")}
                 className={`flex-1 py-1.5 rounded-md text-sm border ${paymentType === "credit" ? "bg-amber-50 border-amber-400 text-amber-800" : "border-slate-300 text-slate-500"}`}>Credit</button>
             </div>
@@ -2044,7 +2126,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
           <div className="flex justify-between mb-4">
             <div><div className="text-lg font-semibold">{current.customer}</div><div className="text-xs text-slate-400 font-mono">{current.number} · {current.date}{current.time ? ` ${current.time}` : ""}{current.createdBy ? ` · by ${current.createdBy}` : ""}</div></div>
             <div className="flex gap-1.5">
-              <Tag tone={current.paymentType === "credit" ? "pending" : "good"}>{current.paymentType === "credit" ? "Credit" : "Cash"}</Tag>
+              <Tag tone={current.paymentType === "credit" ? "pending" : current.paymentType === "ecocash" ? "info" : "good"}>{paymentLabel(current.paymentType)}</Tag>
               {current.paymentType === "credit" && (
                 <Tag tone={current.paidStatus === "paid" ? "good" : current.paidStatus === "partial" ? "pending" : "danger"}>
                   {current.paidStatus === "partial" ? "Partially paid" : current.paidStatus}
@@ -2070,7 +2152,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
               <Btn variant="outline" onClick={() => setPrintJob({ mode: "doc", payload: {
                 title: "SALES ORDER", number: current.number, date: current.date, partyLabel: "Customer",
                 partyName: current.customer, items: current.items.map(l => ({ ...l, name: (data.products.find(p=>p.id===l.productId)||{}).name || "—" })), total: current.total,
-                extraLine: `Payment: ${current.paymentType === "credit" ? "Credit" : "Cash"}`
+                extraLine: `Payment: ${paymentLabel(current.paymentType)}`
               }})}><Printer size={14} /> Print A4 / PDF</Btn>
               <Btn onClick={() => printViaBluetoothPrintApp({
                 number: current.number, date: current.date, partyName: current.customer,
@@ -2104,9 +2186,17 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
               <Field label={`Amount received (max ${money(remainingOn(current))})`}>
                 <input type="number" min="1" max={remainingOn(current)} step="0.01" className={inputCls} value={paymentAmount} onChange={(e) => setPaymentAmount(e.target.value)} />
               </Field>
+              <Field label="Received as">
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setPaymentMethod("cash")}
+                    className={`flex-1 py-1.5 rounded-md text-sm border ${paymentMethod === "cash" ? "bg-emerald-50 border-emerald-400 text-emerald-700" : "border-slate-300 text-slate-500"}`}>Cash</button>
+                  <button type="button" onClick={() => setPaymentMethod("ecocash")}
+                    className={`flex-1 py-1.5 rounded-md text-sm border ${paymentMethod === "ecocash" ? "bg-sky-50 border-sky-400 text-sky-700" : "border-slate-300 text-slate-500"}`}>EcoCash</button>
+                </div>
+              </Field>
               <div className="flex justify-end gap-2 pt-4">
                 <Btn variant="ghost" onClick={() => setShowPaymentForm(false)} disabled={payingBusy}>Cancel</Btn>
-                <Btn onClick={() => recordPayment(current, paymentAmount)} disabled={payingBusy}>
+                <Btn onClick={() => recordPayment(current, paymentAmount, paymentMethod)} disabled={payingBusy}>
                   {payingBusy ? <><Loader2 size={14} className="animate-spin" /> Saving…</> : <><Check size={14} /> Save payment</>}
                 </Btn>
               </div>
@@ -2122,7 +2212,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
       <DateFilterBar date={filterDate} setDate={setFilterDate} />
       <DocList title="Sales Orders" subtitle={`Showing orders for ${formatDateLabel(filterDate)}. Saving one removes stock automatically — can't exceed what's in stock.`}
         docs={data.salesOrders.filter((o) => o.date === filterDate)} columns={["Number", "Date", "Customer", "Total"]} onNew={openNew} onOpen={openView}
-        renderTag={(d) => d.paymentType === "credit" ? <Tag tone={d.paidStatus === "paid" ? "good" : d.paidStatus === "partial" ? "pending" : "danger"}>Credit · {d.paidStatus === "partial" ? "Partially paid" : d.paidStatus}</Tag> : <Tag tone="good">Cash</Tag>} />
+        renderTag={(d) => d.paymentType === "credit" ? <Tag tone={d.paidStatus === "paid" ? "good" : d.paidStatus === "partial" ? "pending" : "danger"}>Credit · {d.paidStatus === "partial" ? "Partially paid" : d.paidStatus}</Tag> : <Tag tone={d.paymentType === "ecocash" ? "info" : "good"}>{paymentLabel(d.paymentType)}</Tag>} />
     </div>
   );
 }
@@ -2608,19 +2698,20 @@ function TransferInRegister({ data, setData, save, user }) {
 function DailySalesReport({ data }) {
   const [filterDate, setFilterDate] = useState(todayISO());
   const rows = data.salesOrders.filter((o) => o.date === filterDate);
-  const totalCash = rows.filter((o) => o.paymentType !== "credit").reduce((s, o) => s + o.total, 0);
+  const totalCash = rows.filter((o) => o.paymentType === "cash").reduce((s, o) => s + o.total, 0);
+  const totalEcocash = rows.filter((o) => o.paymentType === "ecocash").reduce((s, o) => s + o.total, 0);
   const totalCredit = rows.filter((o) => o.paymentType === "credit").reduce((s, o) => s + o.total, 0);
   return (
     <div>
       <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Daily Sales Report</h2>
-      <p className="text-sm text-slate-500 mb-4">Sales orders for {formatDateLabel(filterDate)}, split by cash and credit, before any expenses.</p>
+      <p className="text-sm text-slate-500 mb-4">Sales orders for {formatDateLabel(filterDate)}, split by cash, EcoCash and credit, before any expenses.</p>
       <DateFilterBar date={filterDate} setDate={setFilterDate} />
       <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
             <tr>
               <th className="text-left px-3 py-2">Number</th><th className="text-left px-3 py-2">Customer</th>
-              <th className="text-right px-3 py-2">Cash</th><th className="text-right px-3 py-2">Credit</th><th className="text-right px-3 py-2">Total</th>
+              <th className="text-right px-3 py-2">Cash</th><th className="text-right px-3 py-2">EcoCash</th><th className="text-right px-3 py-2">Credit</th><th className="text-right px-3 py-2">Total</th>
             </tr>
           </thead>
           <tbody>
@@ -2628,20 +2719,22 @@ function DailySalesReport({ data }) {
               <tr key={o.id} className="border-t border-slate-100">
                 <td className="px-3 py-2 font-mono text-xs">{o.number}</td>
                 <td className="px-3 py-2">{o.customer}</td>
-                <td className="px-3 py-2 text-right font-mono">{o.paymentType === "credit" ? "—" : money(o.total)}</td>
+                <td className="px-3 py-2 text-right font-mono">{o.paymentType === "cash" ? money(o.total) : "—"}</td>
+                <td className="px-3 py-2 text-right font-mono">{o.paymentType === "ecocash" ? money(o.total) : "—"}</td>
                 <td className="px-3 py-2 text-right font-mono">{o.paymentType === "credit" ? money(o.total) : "—"}</td>
                 <td className="px-3 py-2 text-right font-mono font-medium">{money(o.total)}</td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={5} className="text-center text-slate-400 py-8 text-sm">No sales on this date.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={6} className="text-center text-slate-400 py-8 text-sm">No sales on this date.</td></tr>}
           </tbody>
           {rows.length > 0 && (
             <tfoot>
               <tr className="border-t-2 border-slate-300 bg-slate-50 font-semibold">
                 <td colSpan={2} className="px-3 py-2">Totals</td>
                 <td className="px-3 py-2 text-right font-mono text-emerald-700">{money(totalCash)}</td>
+                <td className="px-3 py-2 text-right font-mono text-sky-700">{money(totalEcocash)}</td>
                 <td className="px-3 py-2 text-right font-mono text-amber-700">{money(totalCredit)}</td>
-                <td className="px-3 py-2 text-right font-mono">{money(totalCash + totalCredit)}</td>
+                <td className="px-3 py-2 text-right font-mono">{money(totalCash + totalEcocash + totalCredit)}</td>
               </tr>
             </tfoot>
           )}
@@ -2807,19 +2900,39 @@ function buildCashBookRows(data) {
     ...data.salesOrders.map((o) => o.date),
     ...data.expenses.map((e) => e.date),
     ...(data.payments || []).map((p) => p.date),
+    ...(data.returns || []).filter((r) => (r.refundAmount || 0) > 0).map((r) => r.date),
   ]);
   const sorted = Array.from(dates).sort();
-  let running = 0;
+  let cashRunning = 0;
+  let ecocashRunning = 0;
   return sorted.map((date) => {
-    const cashSales = data.salesOrders.filter((o) => o.date === date && o.paymentType !== "credit").reduce((s, o) => s + o.total, 0);
+    const cashSales = data.salesOrders.filter((o) => o.date === date && o.paymentType === "cash").reduce((s, o) => s + o.total, 0);
+    const ecocashSales = data.salesOrders.filter((o) => o.date === date && o.paymentType === "ecocash").reduce((s, o) => s + o.total, 0);
     const creditSales = data.salesOrders.filter((o) => o.date === date && o.paymentType === "credit").reduce((s, o) => s + o.total, 0);
+
     const creditPayments = (data.payments || []).filter((p) => p.date === date);
-    const creditPaymentsTotal = creditPayments.reduce((s, p) => s + p.amount, 0);
+    const creditPaymentsCash = creditPayments.filter((p) => (p.method || "cash") === "cash").reduce((s, p) => s + p.amount, 0);
+    const creditPaymentsEcocash = creditPayments.filter((p) => p.method === "ecocash").reduce((s, p) => s + p.amount, 0);
+    const creditPaymentsTotal = creditPaymentsCash + creditPaymentsEcocash;
+
+    const refunds = (data.returns || []).filter((r) => r.date === date && (r.refundAmount || 0) > 0);
+    const refundsCash = refunds.filter((r) => (r.refundMethod || "cash") === "cash").reduce((s, r) => s + r.refundAmount, 0);
+    const refundsEcocash = refunds.filter((r) => r.refundMethod === "ecocash").reduce((s, r) => s + r.refundAmount, 0);
+    const refundsTotal = refundsCash + refundsEcocash;
+
     const expenses = data.expenses.filter((e) => e.date === date).reduce((s, e) => s + e.amount, 0);
-    const cashIn = cashSales + creditPaymentsTotal;
-    const net = cashIn - expenses;
-    running += net;
-    return { date, cashSales, creditSales, creditPaymentsTotal, creditPayments, totalSales: cashSales + creditSales, expenses, net, cashInHand: running };
+
+    const cashNet = cashSales + creditPaymentsCash - refundsCash - expenses;
+    const ecocashNet = ecocashSales + creditPaymentsEcocash - refundsEcocash;
+    cashRunning += cashNet;
+    ecocashRunning += ecocashNet;
+
+    return {
+      date, cashSales, ecocashSales, creditSales, totalSales: cashSales + ecocashSales + creditSales,
+      creditPayments, creditPaymentsTotal, creditPaymentsCash, creditPaymentsEcocash,
+      refunds, refundsTotal, refundsCash, refundsEcocash,
+      expenses, cashNet, ecocashNet, cashInHand: cashRunning, ecocashInHand: ecocashRunning,
+    };
   }).reverse();
 }
 
@@ -2833,18 +2946,21 @@ function DailyCashBook({ data }) {
   return (
     <div>
       <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Daily Cash Book</h2>
-      <p className="text-sm text-slate-500 mb-4">Starts fresh every day. Cash sales and credit payments actually received make up that day's cash in hand — credit sales are shown for reference only, until paid. For the running total across days, see Accounting → Reports.</p>
-      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+      <p className="text-sm text-slate-500 mb-4">Starts fresh every day. Cash and EcoCash sales, plus credit payments actually received, make up that day's balances — credit sales are shown for reference only, until paid. For the running total across days, see Accounting → Reports.</p>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
             <tr>
               <th className="text-left px-3 py-2">Date</th>
               <th className="text-right px-3 py-2">Cash Sales</th>
+              <th className="text-right px-3 py-2">EcoCash Sales</th>
               <th className="text-right px-3 py-2">Credit Sales</th>
               <th className="text-right px-3 py-2">Credit Paid</th>
+              <th className="text-right px-3 py-2">Refunds</th>
               <th className="text-right px-3 py-2">Total Sales</th>
               <th className="text-right px-3 py-2">Expenses</th>
               <th className="text-right px-3 py-2">Cash in Hand (day)</th>
+              <th className="text-right px-3 py-2">EcoCash (day)</th>
             </tr>
           </thead>
           <tbody>
@@ -2852,21 +2968,31 @@ function DailyCashBook({ data }) {
               <tr key={r.date} className="border-t border-slate-100 align-top">
                 <td className="px-3 py-2">{r.date}</td>
                 <td className="px-3 py-2 text-right font-mono text-emerald-700">{money(r.cashSales)}</td>
+                <td className="px-3 py-2 text-right font-mono text-sky-700">{money(r.ecocashSales)}</td>
                 <td className="px-3 py-2 text-right font-mono text-amber-700">{money(r.creditSales)}</td>
                 <td className="px-3 py-2 text-right font-mono text-emerald-700">
                   {money(r.creditPaymentsTotal)}
                   {r.creditPayments.length > 0 && (
                     <div className="text-[10px] text-slate-400 font-mono normal-case mt-0.5">
-                      {r.creditPayments.map((p) => <div key={p.id}>{p.salesOrderNumber} · {p.customer}</div>)}
+                      {r.creditPayments.map((p) => <div key={p.id}>{p.salesOrderNumber} · {p.customer} · {p.method === "ecocash" ? "EcoCash" : "Cash"}</div>)}
+                    </div>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-right font-mono text-red-600">
+                  {r.refundsTotal > 0 ? `(${money(r.refundsTotal)})` : money(0)}
+                  {r.refunds.length > 0 && (
+                    <div className="text-[10px] text-slate-400 font-mono normal-case mt-0.5">
+                      {r.refunds.map((rf) => <div key={rf.id}>{rf.number} · {rf.productName} · {rf.refundMethod === "ecocash" ? "EcoCash" : "Cash"}</div>)}
                     </div>
                   )}
                 </td>
                 <td className="px-3 py-2 text-right font-mono">{money(r.totalSales)}</td>
                 <td className="px-3 py-2 text-right font-mono text-red-600">{money(r.expenses)}</td>
-                <td className={`px-3 py-2 text-right font-mono font-semibold ${r.net >= 0 ? "" : "text-red-600"}`}>{money(r.net)}</td>
+                <td className={`px-3 py-2 text-right font-mono font-semibold ${r.cashNet >= 0 ? "" : "text-red-600"}`}>{money(r.cashNet)}</td>
+                <td className={`px-3 py-2 text-right font-mono font-semibold ${r.ecocashNet >= 0 ? "" : "text-red-600"}`}>{money(r.ecocashNet)}</td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={7} className="text-center text-slate-400 py-8 text-sm">No activity recorded yet.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={10} className="text-center text-slate-400 py-8 text-sm">No activity recorded yet.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -2884,19 +3010,21 @@ function RunningCashBook({ data }) {
   return (
     <div>
       <h2 className="text-lg font-semibold text-[#1F2428] mb-1">Cash Book — Running Total</h2>
-      <p className="text-sm text-slate-500 mb-4">Same as the Daily Cash Book in Sales, but carrying a cumulative cash-in-hand balance across every day on record.</p>
-      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+      <p className="text-sm text-slate-500 mb-4">Same as the Daily Cash Book in Sales, but carrying cumulative Cash and EcoCash balances across every day on record.</p>
+      <div className="border border-slate-200 rounded-lg overflow-hidden bg-white overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-[11px] font-mono uppercase tracking-wide text-slate-500">
             <tr>
               <th className="text-left px-3 py-2">Date</th>
               <th className="text-right px-3 py-2">Cash Sales</th>
+              <th className="text-right px-3 py-2">EcoCash Sales</th>
               <th className="text-right px-3 py-2">Credit Sales</th>
               <th className="text-right px-3 py-2">Credit Paid</th>
+              <th className="text-right px-3 py-2">Refunds</th>
               <th className="text-right px-3 py-2">Total Sales</th>
               <th className="text-right px-3 py-2">Expenses</th>
-              <th className="text-right px-3 py-2">Net (day)</th>
               <th className="text-right px-3 py-2">Cash in Hand (running)</th>
+              <th className="text-right px-3 py-2">EcoCash (running)</th>
             </tr>
           </thead>
           <tbody>
@@ -2904,15 +3032,17 @@ function RunningCashBook({ data }) {
               <tr key={r.date} className="border-t border-slate-100 align-top">
                 <td className="px-3 py-2">{r.date}</td>
                 <td className="px-3 py-2 text-right font-mono text-emerald-700">{money(r.cashSales)}</td>
+                <td className="px-3 py-2 text-right font-mono text-sky-700">{money(r.ecocashSales)}</td>
                 <td className="px-3 py-2 text-right font-mono text-amber-700">{money(r.creditSales)}</td>
                 <td className="px-3 py-2 text-right font-mono text-emerald-700">{money(r.creditPaymentsTotal)}</td>
+                <td className="px-3 py-2 text-right font-mono text-red-600">{r.refundsTotal > 0 ? `(${money(r.refundsTotal)})` : money(0)}</td>
                 <td className="px-3 py-2 text-right font-mono">{money(r.totalSales)}</td>
                 <td className="px-3 py-2 text-right font-mono text-red-600">{money(r.expenses)}</td>
-                <td className={`px-3 py-2 text-right font-mono ${r.net >= 0 ? "text-emerald-700" : "text-red-600"}`}>{money(r.net)}</td>
                 <td className="px-3 py-2 text-right font-mono font-semibold">{money(r.cashInHand)}</td>
+                <td className="px-3 py-2 text-right font-mono font-semibold">{money(r.ecocashInHand)}</td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={8} className="text-center text-slate-400 py-8 text-sm">No activity recorded yet.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={10} className="text-center text-slate-400 py-8 text-sm">No activity recorded yet.</td></tr>}
           </tbody>
         </table>
       </div>
