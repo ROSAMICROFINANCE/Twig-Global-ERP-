@@ -27,6 +27,10 @@ const money = (n) =>
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const nowTime = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+// Round a stock quantity to 3 decimals so half/partial quantities
+// (e.g. 1.5 m) never show floating-point noise like 0.30000000000000004.
+const roundQty = (n) => Math.round((Number(n) || 0) * 1000) / 1000;
+
 // Payment method label — "cash" | "ecocash" | "credit"
 const paymentLabel = (t) => (t === "ecocash" ? "EcoCash" : t === "credit" ? "Credit" : "Cash");
 
@@ -504,7 +508,7 @@ function LineItemsEditor({ items, setItems, products, priceField, showCost }) {
           </div>
           <div className="grid grid-cols-3 gap-2">
             <Field label="Qty">
-              <input type="number" inputMode="numeric" min="0" className={inputCls + " text-base"} value={line.qty}
+              <input type="number" inputMode="decimal" min="0" step="any" className={inputCls + " text-base"} value={line.qty}
                 onChange={(e) => updateLine(line.id, { qty: Number(e.target.value) })} />
             </Field>
             <Field label={showCost ? "Unit Cost" : "Unit Price"}>
@@ -1046,8 +1050,8 @@ function StockLevels({ data, setData, save, user }) {
                 <Field label="Sell price"><input type="number" step="0.01" className={inputCls} value={form.sellPrice} onChange={(e) => setForm({ ...form, sellPrice: Number(e.target.value) })} /></Field>
               </div>
               <div className="grid grid-cols-2 gap-3">
-                <Field label="Current stock"><input type="number" className={inputCls} value={form.stock} onChange={(e) => setForm({ ...form, stock: Number(e.target.value) })} /></Field>
-                <Field label="Minimum stock"><input type="number" className={inputCls} value={form.minStock} onChange={(e) => setForm({ ...form, minStock: Number(e.target.value) })} /></Field>
+                <Field label="Current stock"><input type="number" step="any" className={inputCls} value={form.stock} onChange={(e) => setForm({ ...form, stock: Number(e.target.value) })} /></Field>
+                <Field label="Minimum stock"><input type="number" step="any" className={inputCls} value={form.minStock} onChange={(e) => setForm({ ...form, minStock: Number(e.target.value) })} /></Field>
               </div>
               <div className="flex justify-end gap-2 pt-2">
                 <Btn variant="ghost" onClick={() => setShowForm(false)}>Cancel</Btn>
@@ -1104,10 +1108,10 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
       if (qty <= 0 || qty > selected.remaining) { alert(`Enter a quantity between 1 and ${selected.remaining} (what's left refundable from that sale).`); return; }
     }
     const stockChange = form.type === "good" ? qty : -qty;
-    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + stockChange } : p)) });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: roundQty(p.stock + stockChange) } : p)) });
     save((fresh) => {
       const freshProduct = fresh.products.find((p) => p.id === form.productId) || product;
-      const products = fresh.products.map((p) => (p.id === form.productId ? { ...p, stock: p.stock + stockChange } : p));
+      const products = fresh.products.map((p) => (p.id === form.productId ? { ...p, stock: roundQty(p.stock + stockChange) } : p));
       const entry = {
         id: uid(), number: nextNumber("RET", fresh.counters.ret), date: todayISO(),
         type: form.type, productId: form.productId, productName: freshProduct.name, qty,
@@ -1196,7 +1200,7 @@ function GoodsReturnsRegister({ data, setData, save, user }) {
                 </Field>
               )}
 
-              <Field label="Quantity"><input type="number" min="1" max={form.refund && selected ? selected.remaining : undefined} className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
+              <Field label="Quantity"><input type="number" inputMode="decimal" min="0.01" step="any" max={form.refund && selected ? selected.remaining : undefined} className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
 
               {form.refund && (
                 <Field label="Refund as">
@@ -1247,14 +1251,14 @@ function RepackRegister({ data, setData, save, user }) {
     if (source.stock < sourceQty) { if (!confirm(`Only ${source.stock} of ${source.name} in stock. Repack anyway?`)) return; }
     const unitCost = targetQty > 0 ? (source.costPrice * sourceQty) / targetQty : target.costPrice;
     setData({ ...data, products: data.products.map((p) => {
-      if (p.id === source.id) return { ...p, stock: p.stock - sourceQty };
-      if (p.id === target.id) return { ...p, stock: p.stock + targetQty, costPrice: unitCost, lastRestocked: todayISO() };
+      if (p.id === source.id) return { ...p, stock: roundQty(p.stock - sourceQty) };
+      if (p.id === target.id) return { ...p, stock: roundQty(p.stock + targetQty), costPrice: unitCost, lastRestocked: todayISO() };
       return p;
     }) });
     save((fresh) => {
       const products = fresh.products.map((p) => {
-        if (p.id === source.id) return { ...p, stock: p.stock - sourceQty };
-        if (p.id === target.id) return { ...p, stock: p.stock + targetQty, costPrice: unitCost, lastRestocked: todayISO() };
+        if (p.id === source.id) return { ...p, stock: roundQty(p.stock - sourceQty) };
+        if (p.id === target.id) return { ...p, stock: roundQty(p.stock + targetQty), costPrice: unitCost, lastRestocked: todayISO() };
         return p;
       });
       const entry = {
@@ -1309,11 +1313,11 @@ function RepackRegister({ data, setData, save, user }) {
               <Field label="Source product (the larger unit you're breaking down)">
                 <ProductPicker products={data.products} value={form.sourceProductId} onChange={(id) => setForm({ ...form, sourceProductId: id })} />
               </Field>
-              <Field label="How many of the source to break down"><input type="number" min="1" className={inputCls} value={form.sourceQty} onChange={(e) => setForm({ ...form, sourceQty: e.target.value })} /></Field>
+              <Field label="How many of the source to break down"><input type="number" inputMode="decimal" min="0.01" step="any" className={inputCls} value={form.sourceQty} onChange={(e) => setForm({ ...form, sourceQty: e.target.value })} /></Field>
               <Field label="Target product (the smaller unit you sell)">
                 <ProductPicker products={data.products} value={form.targetProductId} onChange={(id) => setForm({ ...form, targetProductId: id })} />
               </Field>
-              <Field label="Target units produced per 1 source unit"><input type="number" min="1" className={inputCls} value={form.yieldPerUnit} onChange={(e) => setForm({ ...form, yieldPerUnit: e.target.value })} /></Field>
+              <Field label="Target units produced per 1 source unit"><input type="number" inputMode="decimal" min="0.01" step="any" className={inputCls} value={form.yieldPerUnit} onChange={(e) => setForm({ ...form, yieldPerUnit: e.target.value })} /></Field>
               {source && target && sourceQty > 0 && yieldPerUnit > 0 && (
                 <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-md p-2">
                   This removes <span className="font-mono">{sourceQty}</span> × {source.name} from stock and adds <span className="font-mono">{targetQty}</span> × {target.name}, at a new cost of {money((source.costPrice * sourceQty) / (targetQty || 1))} per {target.name}.
@@ -1858,7 +1862,7 @@ function QuotationModule({ data, setData, save, setPrintJob, user }) {
         const salesOrder = { id: uid(), number, customer: quote.customer, date: todayISO(), time: nowTime(), items: soItems, total: quote.total, quoteId: quote.id, createdBy: user.username, paymentType: "cash", paidStatus: "paid" };
         const products = fresh.products.map((p) => {
           const l = quote.items.find((l) => l.productId === p.id);
-          return l ? { ...p, stock: p.stock - l.qty } : p;
+          return l ? { ...p, stock: roundQty(p.stock - l.qty) } : p;
         });
         const quotes = fresh.quotes.map((q) => (q.id === quote.id ? { ...q, status: "converted" } : q));
         const salesOrders = [salesOrder, ...fresh.salesOrders];
@@ -2017,7 +2021,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
           id: uid(), number, customer, date: todayISO(), time: nowTime(), items: soItems, total, createdBy: user.username,
           paymentType, paidStatus: paymentType === "credit" ? "unpaid" : "paid", amountPaid: paymentType === "credit" ? 0 : total,
         };
-        const products = fresh.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: p.stock - l.qty } : p; });
+        const products = fresh.products.map((p) => { const l = items.find((l) => l.productId === p.id); return l ? { ...p, stock: roundQty(p.stock - l.qty) } : p; });
         const salesOrders = [salesOrder, ...fresh.salesOrders];
         const counters = { ...fresh.counters, sales: fresh.counters.sales + 1 };
         return { products, salesOrders, counters };
@@ -2313,7 +2317,7 @@ function PurchaseOrderModule({ data, setData, save, setPrintJob, user }) {
       const { fresh, changes } = await save((fresh) => {
         const products = fresh.products.map((p) => {
           const l = po.items.find((l) => l.productId === p.id);
-          return l ? { ...p, stock: p.stock + l.qty, lastRestocked: todayISO(), costPrice: l.price || p.costPrice } : p;
+          return l ? { ...p, stock: roundQty(p.stock + l.qty), lastRestocked: todayISO(), costPrice: l.price || p.costPrice } : p;
         });
         const purchaseOrders = fresh.purchaseOrders.map((p) => (p.id === po.id ? { ...p, status: "received", receivedDate: todayISO() } : p));
         return { products, purchaseOrders };
@@ -2428,7 +2432,7 @@ function TransferOutRegister({ data, setData, save, user }) {
     if (!product) return;
     const qty = Number(form.qty) || 0;
     if (product.stock < qty) { if (!confirm(`Only ${product.stock} in stock. Send out anyway?`)) return; }
-    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock - qty } : p)) });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: roundQty(p.stock - qty) } : p)) });
     save((fresh) => {
       const freshProduct = fresh.products.find((p) => p.id === product.id) || product;
       const entry = {
@@ -2436,7 +2440,7 @@ function TransferOutRegister({ data, setData, save, user }) {
         productId: freshProduct.id, productName: freshProduct.name, qty, party: form.party, notes: form.notes,
         valueAtCost: qty * freshProduct.costPrice, createdBy: user.username,
       };
-      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock - qty } : p));
+      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: roundQty(p.stock - qty) } : p));
       const transfers = [entry, ...fresh.transfers];
       const counters = { ...fresh.counters, transfer: fresh.counters.transfer + 1 };
       return { products, transfers, counters };
@@ -2489,7 +2493,7 @@ function TransferOutRegister({ data, setData, save, user }) {
             </div>
             <form onSubmit={submit} className="space-y-3">
               <Field label="Product"><ProductPicker products={data.products} value={form.productId} onChange={(id) => setForm({ ...form, productId: id })} /></Field>
-              <Field label="Quantity"><input type="number" min="1" className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
+              <Field label="Quantity"><input type="number" inputMode="decimal" min="0.01" step="any" className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
               <Field label="Given to (name)"><input required className={inputCls} value={form.party} onChange={(e) => setForm({ ...form, party: e.target.value })} /></Field>
               <Field label="Notes"><input className={inputCls} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder="e.g. borrowed, to be returned" /></Field>
               <div className="flex justify-end gap-2 pt-2">
@@ -2529,7 +2533,7 @@ function LoanReturnsRegister({ data, setData, save, user }) {
     const qty = Number(form.qty) || 0;
     const remaining = withRemaining(loan).remaining;
     if (qty <= 0 || qty > remaining) { alert(`Enter a quantity between 1 and ${remaining} (what's still outstanding on this transfer).`); return; }
-    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p)) });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: roundQty(p.stock + qty) } : p)) });
     save((fresh) => {
       const freshProduct = fresh.products.find((p) => p.id === product.id) || product;
       const entry = {
@@ -2537,7 +2541,7 @@ function LoanReturnsRegister({ data, setData, save, user }) {
         transferOutId: loan.id, transferOutNumber: loan.number, productId: freshProduct.id, productName: freshProduct.name,
         party: loan.party, qty, notes: form.notes, valueAtCost: qty * freshProduct.costPrice, createdBy: user.username,
       };
-      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
+      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: roundQty(p.stock + qty) } : p));
       const loanReturns = [entry, ...(fresh.loanReturns || [])];
       const counters = { ...fresh.counters, loanReturn: fresh.counters.loanReturn + 1 };
       return { products, loanReturns, counters };
@@ -2592,7 +2596,7 @@ function LoanReturnsRegister({ data, setData, save, user }) {
               </Field>
               {selectedLoan && (
                 <Field label={`Quantity returning now (max ${selectedLoan.remaining})`}>
-                  <input type="number" min="1" max={selectedLoan.remaining} className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} />
+                  <input type="number" inputMode="decimal" min="0.01" step="any" max={selectedLoan.remaining} className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} />
                 </Field>
               )}
               <Field label="Notes"><input className={inputCls} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>
@@ -2623,7 +2627,7 @@ function TransferInRegister({ data, setData, save, user }) {
     const product = data.products.find((p) => p.id === form.productId);
     if (!product) return;
     const qty = Number(form.qty) || 0;
-    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p)) });
+    setData({ ...data, products: data.products.map((p) => (p.id === product.id ? { ...p, stock: roundQty(p.stock + qty) } : p)) });
     save((fresh) => {
       const freshProduct = fresh.products.find((p) => p.id === product.id) || product;
       const entry = {
@@ -2631,7 +2635,7 @@ function TransferInRegister({ data, setData, save, user }) {
         productId: freshProduct.id, productName: freshProduct.name, qty, party: form.party, notes: form.notes,
         valueAtCost: qty * freshProduct.costPrice, createdBy: user.username,
       };
-      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: p.stock + qty } : p));
+      const products = fresh.products.map((p) => (p.id === product.id ? { ...p, stock: roundQty(p.stock + qty) } : p));
       const transfers = [entry, ...fresh.transfers];
       const counters = { ...fresh.counters, transfer: fresh.counters.transfer + 1 };
       return { products, transfers, counters };
@@ -2677,7 +2681,7 @@ function TransferInRegister({ data, setData, save, user }) {
             </div>
             <form onSubmit={submit} className="space-y-3">
               <Field label="Product"><ProductPicker products={data.products} value={form.productId} onChange={(id) => setForm({ ...form, productId: id })} /></Field>
-              <Field label="Quantity"><input type="number" min="1" className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
+              <Field label="Quantity"><input type="number" inputMode="decimal" min="0.01" step="any" className={inputCls} value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} /></Field>
               <Field label="Returned by (name)"><input required className={inputCls} value={form.party} onChange={(e) => setForm({ ...form, party: e.target.value })} /></Field>
               <Field label="Notes"><input className={inputCls} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field>
               <div className="flex justify-end gap-2 pt-2">
