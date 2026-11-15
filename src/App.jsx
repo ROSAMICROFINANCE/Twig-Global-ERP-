@@ -148,6 +148,20 @@ async function ensureLocationDoc(locationId) {
   const snap = await getDoc(locationDocRef(locationId));
   if (!snap.exists()) await setDoc(locationDocRef(locationId), emptyData());
 }
+// Firestore refuses to save any field whose value is `undefined` (it
+// throws "Unsupported field value: undefined" and the whole save fails).
+// Remove those everywhere before writing, so one missing optional field
+// can never block a save again.
+function stripUndefined(value) {
+  if (Array.isArray(value)) return value.map(stripUndefined);
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) if (v !== undefined) out[k] = stripUndefined(v);
+    return out;
+  }
+  return value;
+}
+
 async function saveLocationData(locationId, changes) {
   // Only ever writes the specific top-level fields passed in `changes` —
   // never the whole document. This is deliberate: a full-document setDoc
@@ -160,7 +174,7 @@ async function saveLocationData(locationId, changes) {
   // No try/catch here on purpose — a failed write must propagate so the
   // caller can warn the person and offer a retry, instead of silently
   // pretending the save worked.
-  await updateDoc(locationDocRef(locationId), changes);
+  await updateDoc(locationDocRef(locationId), stripUndefined(changes));
 }
 
 // Race-safe save for anything that appends to or edits a shared list —
@@ -190,7 +204,7 @@ async function saveLocationDataTransactional(locationId, computeChanges) {
   return runTransaction(db, async (tx) => {
     const snap = await tx.get(ref);
     const fresh = mergeWithDefaults(snap.exists() ? snap.data() : {});
-    const changes = computeChanges(fresh);
+    const changes = stripUndefined(computeChanges(fresh));
     tx.update(ref, changes);
     return { fresh, changes };
   });
@@ -2063,7 +2077,7 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
         // silently delete a brand-new order from another device: mapping
         // over a stale local array and writing the whole field back
         // overwrites anything added to it since this device last synced.
-        const salesOrders = fresh.salesOrders.map((o) => (o.id === order.id ? { ...o, amountPaid: newAmountPaid, paidStatus: newStatus, paidDate: newStatus === "paid" ? paidDate : o.paidDate } : o));
+        const salesOrders = fresh.salesOrders.map((o) => (o.id === order.id ? { ...o, amountPaid: newAmountPaid, paidStatus: newStatus, paidDate: newStatus === "paid" ? paidDate : (o.paidDate || null) } : o));
         const payment = { id: uid(), number: nextNumber("PAY", fresh.counters.pay), date: paidDate, salesOrderNumber: order.number, customer: order.customer, amount, method, recordedBy: user.username };
         const payments = [payment, ...fresh.payments];
         const counters = { ...fresh.counters, pay: fresh.counters.pay + 1 };
@@ -2073,7 +2087,11 @@ function SalesOrderModule({ data, setData, save, setPrintJob, user }) {
       setCurrent({ ...order, amountPaid: newAmountPaid, paidStatus: newStatus });
       setShowPaymentForm(false);
     } catch (err) {
-      alert("Couldn't reach the cloud storage — the payment wasn't saved. Nothing has changed; try again once your connection is back.");
+      console.error("Payment save failed", err);
+      const offline = (typeof navigator !== "undefined" && navigator.onLine === false) || (err && (err.code === "unavailable" || err.code === "deadline-exceeded"));
+      alert(offline
+        ? "Couldn't reach the cloud storage — the payment wasn't saved. Nothing has changed; try again once your connection is back."
+        : "The payment wasn't saved because of an error: " + ((err && err.message) || "unknown error") + ". Nothing has changed. Please send a screenshot of this message to support.");
     } finally {
       setPayingBusy(false);
     }
